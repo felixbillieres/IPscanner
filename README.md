@@ -1,4 +1,4 @@
-# OSCP Recon Scanner
+# IP Recon Scanner
 
 ## Description
 Ce script permet d'effectuer des scans réseau automatisés à l'aide de **Nmap**. Il exécute un scan rapide pour identifier les ports ouverts, suivi d'un scan approfondi pour collecter des informations détaillées sur les services et versions en cours d'exécution.
