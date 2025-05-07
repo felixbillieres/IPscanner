@@ -995,10 +995,11 @@ def display_help():
     print("  log                 - Afficher le chemin du fichier de log.")
     print("  exit                - Quitter l'application.")
 
-def main_loop(target_ip, scanned_ports):
+def main_loop(target_ip, scanned_ports, session):
     """Boucle principale pour interagir avec une cible."""
     logging.info(f"Entrée dans la boucle principale pour {target_ip}. Ports scannés: {scanned_ports}")
-    # ... (completers existants)
+    
+    # Création du dictionnaire pour l'auto-complétion des commandes spécifiques à la cible
     target_commands = {
         "help": "Afficher ce message d'aide.",
         "prelim_scan": "Effectuer un scan préliminaire rapide (LDAP/SMB anonyme, ports AD).",
@@ -1016,10 +1017,36 @@ def main_loop(target_ip, scanned_ports):
         "exit": None,
     }
 
+    target_completer = NestedCompleter.from_nested_dict(target_commands)
+
     while True:
+        prompt_text = f"ADExplorer ({AnsiColors.YELLOW}{target_ip}{AnsiColors.ENDC})> "
+        
+        # Construction du bottom_toolbar
+        current_creds_display = []
+        if credentials["username"]:
+            user_display = credentials["username"]
+            if credentials["domain"]:
+                user_display = f"{credentials['domain']}\\{user_display}"
+            current_creds_display.append(f"User: {user_display}")
+        if credentials["password"]:
+            current_creds_display.append("Pass: Set")
+        
+        toolbar_text = f"Log: {LOG_FILE}"
+        if current_creds_display:
+            toolbar_text += " | " + " | ".join(current_creds_display)
+
+        def get_bottom_toolbar():
+            return toolbar_text
+
         try:
-            prompt_text = f"ad_explorer ({target_ip})> "
-            user_input = session.prompt(prompt_text, completer=completer, bottom_toolbar=f"Log: {LOG_FILE}")
+            user_input = session.prompt(
+                prompt_text,
+                completer=target_completer,
+                auto_suggest=AutoSuggestFromHistory(),
+                style=cli_style, 
+                bottom_toolbar=get_bottom_toolbar
+            )
             user_input = user_input.strip()
             if not user_input:
                 continue
@@ -1035,7 +1062,7 @@ def main_loop(target_ip, scanned_ports):
             elif cmd == "help":
                 print_target_menu(target_commands)
             elif cmd == "prelim_scan":
-                run_preliminary_scan(target_ip, scanned_ports, session) # Passer scanned_ports
+                run_preliminary_scan(target_ip, scanned_ports, session)
             elif cmd == "smb":
                 smb_ports = scanned_ports.get("SMB", {}).get("ports", [])
                 if not smb_ports:
@@ -1060,14 +1087,14 @@ def main_loop(target_ip, scanned_ports):
             elif cmd == "set":
                 if len(command_parts) > 2:
                     cred_type = command_parts[1]
-                    value = " ".join(command_parts[2:]) # Gérer les mots de passe/domaines avec espaces (peu probable pour user)
+                    value = " ".join(command_parts[2:])
                     if cred_type == "user":
                         credentials["username"] = value
                         print(f"Nom d'utilisateur défini sur : {value}")
                         logging.info(f"Identifiant username défini.")
                     elif cred_type == "password":
                         credentials["password"] = value
-                        print("Mot de passe défini.") # Ne pas afficher le mot de passe
+                        print("Mot de passe défini.")
                         logging.info(f"Identifiant password défini.")
                     elif cred_type == "domain":
                         credentials["domain"] = value
@@ -1156,6 +1183,9 @@ Dépendances externes requises (doivent être dans le PATH):
         # print("[-] Aucun service pertinent détecté. L'outil va quand même démarrer en mode limité.")
         # Pour l'instant, on continue pour permettre l'utilisation de 'set creds' etc.
 
-    main_loop(args.target_ip, open_services_found)
+    # Créer la session prompt_toolkit ici
+    session = PromptSession(history=FileHistory('.ad_explorer_target_history'), style=cli_style)
+
+    main_loop(args.target_ip, open_services_found, session) # Passer la session à main_loop
 
     logging.info("AD Explorer terminé.") 
