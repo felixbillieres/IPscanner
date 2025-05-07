@@ -8,6 +8,11 @@ import datetime
 from queue import Queue
 from urllib.parse import urlparse, urljoin
 from urllib.robotparser import RobotFileParser
+import socket
+import sys
+import subprocess
+import shutil
+import json
 
 try:
     from prompt_toolkit import PromptSession
@@ -161,6 +166,148 @@ class RobotsManager:
         full_url = urljoin(self.target_base_url, path)
         return self.rp.can_fetch(user_agent, full_url)
 
+# --- Fonctions Utilitaires (pour les commandes externes) ---
+def check_command_exists(command):
+    """Vérifie si une commande externe existe dans le PATH."""
+    if shutil.which(command) is None:
+        print(f"{Colors.RED}[!] Attention: La commande '{command}' est introuvable. Certaines fonctionnalités pourraient ne pas être disponibles.{Colors.ENDC}")
+        return False
+    return True
+
+def run_command(command_list, capture_output=True, text=True, shell=False):
+    """Exécute une commande externe et retourne sa sortie et son code de retour."""
+    command_str = command_list if shell else " ".join(command_list)
+    print(f"[*] Exécution: {command_str}")
+    try:
+        process = subprocess.run(
+            command_list,
+            capture_output=capture_output,
+            text=text,
+            shell=shell,
+            check=False # Ne pas lever d'exception pour les codes de retour non nuls
+        )
+        return process.stdout, process.stderr, process.returncode
+    except FileNotFoundError:
+        print(f"{Colors.RED}[-] Erreur: Commande '{command_list[0]}' introuvable.{Colors.ENDC}")
+        return None, "Commande non trouvée", -1
+    except Exception as e:
+        print(f"{Colors.RED}[-] Erreur lors de l'exécution de '{command_str}': {e}{Colors.ENDC}")
+        return None, str(e), -1
+
+# --- Découverte des Services Web ---
+DEFAULT_WEB_PORTS = [80, 443, 8000, 8080, 8081, 8443, 8888]
+
+def discover_web_services(target_host, ports_to_scan=None, no_color_mode=False):
+    """Scanne les ports spécifiés pour des services web HTTP/HTTPS."""
+    if ports_to_scan is None:
+        ports_to_scan = DEFAULT_WEB_PORTS
+    
+    active_services = []
+    print(f"[*] Scan des ports web sur {target_host}...")
+
+    for port in ports_to_scan:
+        try:
+            with socket.create_connection((target_host, port), timeout=1):
+                # Port ouvert, essayons de déterminer HTTP/HTTPS
+                # Simplification: 443 est HTTPS, 80 est HTTP. Pour les autres, on essaie HTTP d'abord.
+                # Une détection robuste nécessiterait d'envoyer une requête ou de tenter une connexion SSL.
+                if port == 443 or port == 8443 or port == 3001: # Ports typiquement HTTPS
+                    protocol = "https"
+                else:
+                    protocol = "http" # Par défaut HTTP pour les autres
+
+                # Tentative de confirmation HTTPS pour les ports non standards
+                if protocol == "http" and port not in [80, 8000, 8080]: # Éviter de tester SSL sur des ports HTTP connus
+                    try:
+                        context = ssl.create_default_context()
+                        with socket.create_connection((target_host, port), timeout=1) as sock:
+                            with context.wrap_socket(sock, server_hostname=target_host) as ssock:
+                                protocol = "https" # Connexion SSL réussie
+                                print(f"  {Colors.GREEN if not no_color_mode else ''}[+] Port {port} ({protocol.upper()}) semble être HTTPS.{Colors.ENDC if not no_color_mode else ''}")
+                    except (ssl.SSLError, socket.timeout, ConnectionRefusedError, OSError):
+                        print(f"  {Colors.YELLOW if not no_color_mode else ''}[*] Port {port} ({protocol.upper()}) semble être HTTP (SSL a échoué ou timeout).{Colors.ENDC if not no_color_mode else ''}")
+                        pass # Reste HTTP
+
+                base_url = f"{protocol}://{target_host}:{port}"
+                # Éviter les ports standards dans l'URL si possible
+                if (protocol == "http" and port == 80) or (protocol == "https" and port == 443):
+                    base_url = f"{protocol}://{target_host}"
+                
+                active_services.append(base_url)
+                if not no_color_mode:
+                    print(f"  {Colors.GREEN}[+] Service web détecté sur: {base_url}{Colors.ENDC}")
+                else:
+                    print(f"  [+] Service web détecté sur: {base_url}")
+
+        except (socket.timeout, ConnectionRefusedError, OSError):
+            pass # Port non ouvert ou non joignable
+    
+    if not active_services and not no_color_mode:
+        print(f"{Colors.YELLOW}[-] Aucun service web actif trouvé sur les ports scannés de {target_host}.{Colors.ENDC}")
+    elif not active_services and no_color_mode:
+        print(f"[-] Aucun service web actif trouvé sur les ports scannés de {target_host}.")
+
+    return active_services
+
+# --- Exécution de Feroxbuster ---
+def run_feroxbuster(target_url, no_color_mode=False):
+    """Exécute Feroxbuster sur l'URL cible et retourne les URLs 200 OK."""
+    global found_results
+    if not check_command_exists("feroxbuster"):
+        return []
+
+    print(f"[*] Lancement de Feroxbuster sur {target_url}...")
+    # Utiliser un fichier de sortie temporaire pour les résultats JSON
+    # Nettoyer le nom de domaine pour le nom de fichier
+    parsed_url = urlparse(target_url)
+    safe_filename = f"ferox_{parsed_url.netloc.replace(':', '_')}_{parsed_url.scheme}.json"
+    
+    # Commande Feroxbuster : -u URL, -C 200 (codes de statut), -o fichier_json, -k (ignorer erreurs SSL), -q (silencieux)
+    # --json pour une sortie structurée facile à parser
+    # -d 1 pour limiter la profondeur initiale, on peut l'augmenter si besoin.
+    # On peut ajouter -w <wordlist> si on veut une wordlist spécifique pour feroxbuster.
+    cmd = ["feroxbuster", "-u", target_url, "--status-codes", "200", "--json", "-o", safe_filename, "-k", "-q", "--no-state"]
+    
+    stdout, stderr, ret_code = run_command(cmd, capture_output=False) # Feroxbuster gère sa propre sortie
+
+    ferox_found_urls = []
+    try:
+        if os.path.exists(safe_filename):
+            with open(safe_filename, 'r') as f:
+                for line in f: # Feroxbuster avec --json écrit une ligne JSON par résultat
+                    try:
+                        result = json.loads(line)
+                        if result.get("type") == "response" and result.get("status") == 200:
+                            url = result.get("url")
+                            if url:
+                                ferox_found_urls.append(url)
+                                if not no_color_mode:
+                                    print(f"  {Colors.GREEN}[FEROXBUSTER 200] {url}{Colors.ENDC}")
+                                else:
+                                    print(f"  [FEROXBUSTER 200] {url}")
+                                # Ajout aux résultats globaux
+                                found_results.append({
+                                    'url': url,
+                                    'status': 200,
+                                    'length': result.get("content_length", "N/A"),
+                                    'source': 'feroxbuster'
+                                })
+                    except json.JSONDecodeError:
+                        # Ignorer les lignes qui ne sont pas du JSON valide (ex: résumé)
+                        pass
+            os.remove(safe_filename) # Nettoyer le fichier temporaire
+    except Exception as e:
+        if not no_color_mode:
+            print(f"{Colors.RED}[!] Erreur lors de la lecture des résultats de Feroxbuster: {e}{Colors.ENDC}")
+        else:
+            print(f"[!] Erreur lors de la lecture des résultats de Feroxbuster: {e}")
+
+    if not ferox_found_urls and not no_color_mode:
+        print(f"{Colors.YELLOW}[-] Feroxbuster n'a trouvé aucun résultat 200 OK pour {target_url}.{Colors.ENDC}")
+    elif not ferox_found_urls and no_color_mode:
+         print(f"[-] Feroxbuster n'a trouvé aucun résultat 200 OK pour {target_url}.")
+    return ferox_found_urls
+
 # --- Logique de Scan ---
 def scan_worker(target_url, path_queue, extensions, stealth_mode, stealth_delay, robots_manager, user_agent_for_robots):
     """Travailleur qui prend des chemins de la file et les scanne."""
@@ -214,9 +361,7 @@ def make_request(session, url_to_check, stealth_mode, stealth_delay, original_wo
         with lock:
             total_requests_made += 1
         
-        response = session.get(url_to_check, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True, stream=True) # stream=True pour ne pas dl de gros fichiers
-        
-        # On ferme la connexion pour libérer les ressources, surtout avec stream=True
+        response = session.get(url_to_check, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True, stream=True)
         response.close()
 
         status_code = response.status_code
@@ -237,23 +382,21 @@ def make_request(session, url_to_check, stealth_mode, stealth_delay, original_wo
             color = Colors.RED
 
         with print_lock:
-            # Formatter la sortie avec la couleur
-            status_str = f"[{color}{status_code}{Colors.ENDC}]"
-            url_str = f"{Colors.WHITE}{url_to_check}{Colors.ENDC}"
-            size_str = f"(Taille: {Colors.CYAN}{content_length}{Colors.ENDC})"
-            print(f"{status_str} {url_str} {size_str}")
+            # Affichage plus concis, on a déjà le contexte du service
+            status_colored = f"{color}{status_code}{Colors.ENDC}"
+            path_segment = urlparse(url_to_check).path
+            print(f"  [{status_colored}] {path_segment} (Longueur: {content_length})")
 
-        if status_code == 200:
+        if 200 <= status_code < 300 or status_code in [401, 403]: # Sauvegarder aussi 401/403
             with lock:
-                found_results.append({'url': url_to_check, 'status': status_code, 'ext': original_ext if original_ext.startswith('.') else os.path.splitext(original_ext)[1]})
-        # On pourrait aussi logger d'autres codes intéressants (403, 401, 30x si on ne suit pas les redirections, etc.)
-
-    except requests.exceptions.RequestException as e:
-        # Gérer les erreurs de manière silencieuse ou avec un log discret
-        # with print_lock:
-        #     print(f"[!] Erreur pour {url_to_check}: {type(e).__name__}")
+                found_results.append({
+                    'url': url_to_check,
+                    'status': status_code,
+                    'length': content_length,
+                    'source': 'wordlist' # Ajout de la source
+                })
+    except requests.exceptions.RequestException:
         pass
-
 
 # --- Gestion des Résultats ---
 def save_results(results, target_domain):
@@ -294,12 +437,15 @@ def save_results(results, target_domain):
     
     return output_files, results_dir
 
-# --- Fonction Principale ---
+# --- Fonction Principale (Modifiée) ---
 def main():
-    global total_requests_made, found_results
+    global total_requests_made, found_results, USER_AGENTS # USER_AGENTS est global
 
-    parser = argparse.ArgumentParser(description="Outil de découverte de contenu web intelligent et furtif.")
-    parser.add_argument("target_url", help="URL cible (ex: http://example.com)")
+    parser = argparse.ArgumentParser(description="Outil de découverte de contenu web automatisé et intelligent.")
+    # L'argument principal est maintenant l'hôte/IP, pas une URL complète.
+    parser.add_argument("target_host", help="Hôte cible (ex: example.com ou 192.168.1.10)")
+    parser.add_argument("-p", "--ports", default=",".join(map(str, DEFAULT_WEB_PORTS)),
+                        help=f"Liste de ports web à scanner, séparés par des virgules (défaut: {','.join(map(str, DEFAULT_WEB_PORTS))})")
     parser.add_argument("-w", "--wordlist", default=DEFAULT_WORDLIST, help=f"Chemin vers la wordlist (défaut: {DEFAULT_WORDLIST})")
     parser.add_argument("-x", "--extensions", default=DEFAULT_EXTENSIONS_FILE, help=f"Chemin vers le fichier d'extensions (défaut: {DEFAULT_EXTENSIONS_FILE})")
     parser.add_argument("-t", "--threads", type=int, default=DEFAULT_THREADS, help=f"Nombre de threads (défaut: {DEFAULT_THREADS})")
@@ -310,21 +456,16 @@ def main():
 
     args = parser.parse_args()
 
-    # Désactiver les couleurs si demandé
     if args.no_color:
         for attr in dir(Colors):
             if not callable(getattr(Colors, attr)) and not attr.startswith("__"):
                 setattr(Colors, attr, "")
-
-    # Normaliser l'URL cible
-    if not args.target_url.startswith(('http://', 'https://')):
-        args.target_url = 'http://' + args.target_url
     
-    parsed_target_url = urlparse(args.target_url)
-    target_domain = parsed_target_url.netloc
+    # Charger les user agents une fois globalement
+    load_user_agents(args.user_agents)
 
-    print("--- Configuration du Scan ---")
-    print(f"[*] Cible: {Colors.CYAN}{args.target_url}{Colors.ENDC}")
+    print("--- Configuration Globale du Scan ---")
+    print(f"[*] Hôte Cible: {Colors.CYAN if not args.no_color else ''}{args.target_host}{Colors.ENDC if not args.no_color else ''}")
     print(f"[*] Mode: {Colors.YELLOW}{'Furtif' if args.stealth else 'Agressif'}{Colors.ENDC}")
     print(f"[*] Threads: {Colors.YELLOW}{args.threads}{Colors.ENDC}")
     print(f"[*] Wordlist: {Colors.YELLOW}{args.wordlist}{Colors.ENDC}")
@@ -332,124 +473,79 @@ def main():
     if args.stealth:
         print(f"[*] Délai furtif moyen: {Colors.YELLOW}{args.stealth_delay}s{Colors.ENDC}")
         print(f"[*] Fichier User-Agents: {Colors.YELLOW}{args.user_agents}{Colors.ENDC}")
-    print("-----------------------------\n")
+    print("-----------------------------------\n")
 
-    load_user_agents(args.user_agents)
-
-    # Charger la wordlist
+    # 1. Découverte des services web sur l'hôte cible
     try:
-        with open(args.wordlist, 'r', encoding='utf-8', errors='ignore') as f:
-            words = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-    except FileNotFoundError:
-        print(f"[!] Erreur: Wordlist '{args.wordlist}' non trouvée.")
-        return
-    if not words:
-        print(f"[!] Erreur: Wordlist '{args.wordlist}' est vide.")
-        return
+        ports_to_scan_list = [int(p.strip()) for p in args.ports.split(',')]
+    except ValueError:
+        print(f"{Colors.RED if not args.no_color else ''}[!] Format de liste de ports invalide. Utilisez des nombres séparés par des virgules.{Colors.ENDC if not args.no_color else ''}")
+        sys.exit(1)
+        
+    web_service_urls = discover_web_services(args.target_host, ports_to_scan_list, args.no_color)
 
-    # Charger les extensions de base
-    try:
-        with open(args.extensions, 'r', encoding='utf-8', errors='ignore') as f:
-            base_extensions = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-    except FileNotFoundError:
-        print(f"[!] Erreur: Fichier d'extensions '{args.extensions}' non trouvé.")
-        return
-    if not base_extensions:
-        print(f"[!] Erreur: Fichier d'extensions '{args.extensions}' est vide.")
+    if not web_service_urls:
+        print(f"[-] Aucun service web trouvé sur {args.target_host} avec les ports spécifiés. Arrêt.")
         return
 
-    # Détection du serveur et adaptation des extensions
-    print("[*] Détection du serveur et adaptation des extensions...")
-    server_info = detect_server_and_cms(args.target_url)
-    print(f"[*] Serveur détecté: {Colors.GREEN}{server_info['type']}{Colors.ENDC} ({server_info['details']})")
-    if server_info['cms']:
-        print(f"[*] CMS détectés: {Colors.GREEN}{', '.join(server_info['cms'])}{Colors.ENDC}")
-    
-    final_extensions = adapt_extensions(base_extensions, server_info)
-    if len(final_extensions) != len(base_extensions):
-        print(f"[*] Extensions adaptées pour le serveur/CMS. Nombre total d'extensions à tester: {Colors.YELLOW}{len(final_extensions)}{Colors.ENDC}")
-    else:
-        print(f"[*] Utilisation de la liste d'extensions de base. Nombre total d'extensions à tester: {Colors.YELLOW}{len(final_extensions)}{Colors.ENDC}")
-    # print(f"[*] Extensions finales: {final_extensions[:10]}...") # Debug
+    start_time_global = time.time()
+    total_requests_made = 0 # Réinitialiser le compteur global
+    found_results = [] # Réinitialiser les résultats globaux
 
-    # Gestion de robots.txt pour le mode furtif
-    robots_manager = None
-    user_agent_for_robots = get_random_user_agent() # Utiliser un agent utilisateur cohérent pour robots.txt
-    if args.stealth:
-        print("[*] Analyse de robots.txt...")
-        robots_manager = RobotsManager(args.target_url)
-        # Test:
-        # if robots_manager.can_fetch(user_agent_for_robots, "/private/"):
-        #     print("[*] /private/ est autorisé")
-        # else:
-        #     print("[*] /private/ est interdit par robots.txt")
+    for service_url in web_service_urls:
+        print(f"\n--- Scan du Service Web: {Colors.MAGENTA if not args.no_color else ''}{service_url}{Colors.ENDC if not args.no_color else ''} ---")
+        service_start_time = time.time()
 
+        # 2. Exécution de Feroxbuster pour ce service
+        run_feroxbuster(service_url, args.no_color) # Les résultats sont ajoutés à found_results globalement
 
-    # Initialiser la file de tâches
-    path_queue = Queue()
-    for word in words:
-        path_queue.put(word)
-
-    print(f"\n[*] Démarrage du scan avec {args.threads} threads...")
-    start_time = time.time()
-
-    # Démarrer les threads travailleurs
-    threads_list = []
-    for _ in range(args.threads):
-        thread = threading.Thread(target=scan_worker, args=(
-            args.target_url,
-            path_queue,
-            final_extensions,
+        # 3. Exécution du scan par wordlist pour ce service
+        perform_wordlist_scan_for_service(
+            service_url,
+            args.wordlist,
+            args.extensions,
+            args.threads,
             args.stealth,
-            args.stealth_delay if args.stealth else 0,
-            robots_manager if args.stealth else None,
-            user_agent_for_robots if args.stealth else "*"
-        ))
-        threads_list.append(thread)
-        thread.start()
+            args.stealth_delay,
+            args.user_agents, # Déjà chargé, mais passé pour info ou rechargement si besoin
+            args.no_color
+        )
+        service_end_time = time.time()
+        print(f"[*] Temps pour le service {service_url}: {Colors.YELLOW if not args.no_color else ''}{service_end_time - service_start_time:.2f}s{Colors.ENDC if not args.no_color else ''}")
 
-    # Attendre que la file soit vide (toutes les tâches initiales distribuées)
-    path_queue.join()
 
-    # Attendre que tous les threads aient terminé
-    for t in threads_list:
-        t.join()
+    end_time_global = time.time()
+    scan_duration_global = end_time_global - start_time_global
 
-    end_time = time.time()
-    scan_duration = end_time - start_time
-
-    print("\n--- Scan Terminé ---")
-    print(f"[*] Temps total du scan: {Colors.YELLOW}{scan_duration:.2f} secondes{Colors.ENDC}")
-    print(f"[*] URL Cible: {Colors.CYAN}{args.target_url}{Colors.ENDC}")
-    print(f"[*] Mode de scan: {Colors.YELLOW}{'Furtif' if args.stealth else 'Agressif'}{Colors.ENDC}")
-    print(f"[*] Requêtes totales effectuées: {Colors.YELLOW}{total_requests_made}{Colors.ENDC}")
+    print("\n--- Scan Global Terminé ---")
+    print(f"[*] Temps total du scan: {Colors.YELLOW if not args.no_color else ''}{scan_duration_global:.2f} secondes{Colors.ENDC if not args.no_color else ''}")
+    print(f"[*] Hôte Cible: {Colors.CYAN if not args.no_color else ''}{args.target_host}{Colors.ENDC if not args.no_color else ''}")
+    print(f"[*] Requêtes totales (wordlist scan): {Colors.YELLOW if not args.no_color else ''}{total_requests_made}{Colors.ENDC if not args.no_color else ''}") # Feroxbuster a son propre comptage
     
-    results_200 = [r for r in found_results if r['status'] == 200]
-    print(f"[*] Nombre de résultats 200 OK: {Colors.GREEN}{len(results_200)}{Colors.ENDC}")
+    # Filtrer les résultats 200 OK pour le rapport principal
+    # On pourrait aussi vouloir lister les 401/403 séparément.
+    final_results_200_or_interesting = [r for r in found_results if r['status'] == 200 or r['status'] == 401 or r['status'] == 403]
+    
+    print(f"[*] Nombre total de résultats intéressants (200, 401, 403): {Colors.GREEN if not args.no_color else ''}{len(final_results_200_or_interesting)}{Colors.ENDC if not args.no_color else ''}")
 
-    if results_200:
-        output_files, results_dir_path = save_results(results_200, target_domain)
+    if final_results_200_or_interesting:
+        # La sauvegarde doit maintenant gérer le fait que les résultats proviennent de différents services
+        # et potentiellement de différentes sources (ferox, wordlist).
+        # Le nom de fichier de sauvegarde pourrait inclure l'hôte cible.
+        output_files, results_dir_path = save_results(final_results_200_or_interesting, args.target_host.replace('.', '_'))
         if output_files:
-            print(f"[*] Résultats sauvegardés dans le répertoire: {Colors.GREEN}{results_dir_path}{Colors.ENDC}")
+            print(f"[*] Résultats sauvegardés dans le répertoire: {Colors.GREEN if not args.no_color else ''}{results_dir_path}{Colors.ENDC if not args.no_color else ''}")
             for f_name in output_files:
                 print(f"    - {os.path.basename(f_name)}")
         else:
-            print("[*] Aucun fichier de résultat n'a été créé (pas de 200 OK).")
+            print("[*] Aucun fichier de résultat n'a été créé.")
     else:
-        print("[*] Aucun résultat avec le statut 200 OK trouvé.")
+        print("[*] Aucun résultat intéressant (200, 401, 403) trouvé globalement.")
 
-    print("\n--- Informations Serveur et Extensions ---")
-    print(f"[*] Type de serveur détecté: {Colors.GREEN}{server_info['type']}{Colors.ENDC}")
-    if server_info['details']:
-        print(f"    - En-tête Server: {server_info['details']}")
-    if server_info['cms']:
-        print(f"[*] CMS potentiels détectés: {Colors.GREEN}{', '.join(server_info['cms'])}{Colors.ENDC}")
-    
-    if len(final_extensions) != len(base_extensions):
-        print("[*] Les extensions ont été adaptées en fonction des informations du serveur.")
-        # On pourrait lister les extensions ajoutées/priorisées ici si besoin
-    else:
-        print("[*] La liste d'extensions de base a été utilisée sans adaptation majeure (ou serveur non identifié pour adaptation).")
+    # Les informations serveur sont maintenant par service, affichées dans perform_wordlist_scan_for_service
+    # On pourrait faire un résumé ici si nécessaire.
 
 if __name__ == "__main__":
+    # Ajout pour la détection SSL dans discover_web_services
+    import ssl
     main()

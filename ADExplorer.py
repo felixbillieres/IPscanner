@@ -852,56 +852,83 @@ def display_help():
     print("  exit                - Quitter l'application.")
 
 def print_target_menu(commands_dict):
-    """Affiche le menu des commandes pour une cible."""
-    print("\nCommandes disponibles pour la cible actuelle:")
-    # Trouver la longueur maximale de la clé de commande pour l'alignement
-    max_key_len = 0
-    if commands_dict: # S'assurer que le dictionnaire n'est pas vide
-        max_key_len = max(len(key) for key in commands_dict.keys())
-    
-    for command, description in commands_dict.items():
-        print(f"  {AnsiColors.YELLOW}{command:<{max_key_len}}{AnsiColors.ENDC}  -  {description}")
+    """Affiche le menu des commandes pour une cible de manière structurée."""
+    print(f"\n{AnsiColors.BOLD}Commandes disponibles pour la cible actuelle:{AnsiColors.ENDC}")
+
+    # Déterminer la largeur maximale pour l'alignement des commandes
+    max_cmd_len = 0
+    for section_details in commands_dict.values():
+        for cmd_example in section_details.keys():
+            if len(cmd_example) > max_cmd_len:
+                max_cmd_len = len(cmd_example)
+    max_cmd_len += 2 # Ajouter un peu d'espace
+
+    for section_title, section_commands in commands_dict.items():
+        print(f"\n  {AnsiColors.CYAN}{section_title}{AnsiColors.ENDC}")
+        print(f"  {''.join(['-'] * (len(section_title) + 2))}") # Ligne de séparation
+        for cmd_example, description in section_commands.items():
+            print(f"    {AnsiColors.YELLOW}{cmd_example:<{max_cmd_len}}{AnsiColors.ENDC} {description}")
     print("")
 
 def main_loop(target_ip, scanned_ports, session):
     """Boucle principale pour interagir avec une cible."""
     logging.info(f"Entrée dans la boucle principale pour {target_ip}. Ports scannés: {scanned_ports}")
     
-    # Dictionnaire des commandes pour l'affichage de l'aide
+    # Dictionnaire des commandes pour l'affichage de l'aide (structuré par sections)
     target_commands_help = {
-        "help": "Afficher ce message d'aide.",
-        "prelim_scan": "Effectuer un scan préliminaire rapide.",
-        "smb": "Explorer les services SMB.",
-        "ldap": "Explorer les services LDAP/LDAPS.",
-        "discoverusers": "Tenter différentes techniques de découverte d'utilisateurs.",
-        "services": "Afficher les services détectés.",
-        "set user <username>": "Définir l'utilisateur unique pour certaines actions.",
-        "set password <password>": "Définir le mot de passe unique.",
-        "set domain <domain_name>": "Définir le domaine (pour identifiants uniques ET multiples).",
-        "creds": "Afficher les identifiants configurés (uniques et multiples).",
-        "clear creds": "Effacer tous les identifiants configurés.",
-        "back": "Quitter la session cible actuelle.",
-        "exit": "Quitter l'application."
+        "Commandes Générales": {
+            "help": "Afficher ce message d'aide.",
+            "services": "Afficher les services détectés lors du scan initial.",
+            "prelim_scan": "Effectuer un scan préliminaire rapide (LDAP/SMB anonyme, ports AD).",
+            "back": "Quitter la session avec la cible actuelle.",
+            "exit": "Quitter l'application ADExplorer."
+        },
+        "Gestion des Identifiants (Session Unique)": {
+            "set user <username>": "Définir le nom d'utilisateur pour les actions manuelles futures.",
+            "set password <password>": "Définir le mot de passe pour les actions manuelles futures.",
+            "set domain <domain>": "Définir le domaine pour les actions manuelles futures (et pour `testcreds` si non spécifié dans multi_credentials).",
+        },
+        "Gestion des Identifiants (Tests Multiples)": {
+            "set users <user1,user2,...>": "Définir une liste d'utilisateurs pour `testcreds`.",
+            "set usersfile <path/to/users.txt>": "Charger une liste d'utilisateurs depuis un fichier pour `testcreds`.",
+            "set passwords <pass1,pass2,...>": "Définir une liste de mots de passe pour `testcreds`.",
+            "set passwordsfile <path/to/pass.txt>": "Charger une liste de mots de passe depuis un fichier pour `testcreds`.",
+            "set hashes <hash1,hash2,...>": "Définir une liste de hashes NTLM pour `testcreds`.",
+            "set hashesfile <path/to/hashes.txt>": "Charger une liste de hashes NTLM depuis un fichier pour `testcreds`.",
+            "set domain <domain_name>": "Définir le domaine cible pour les tests d'identifiants multiples (affecte `multi_credentials.domain`).",
+        },
+        "Affichage et Nettoyage des Identifiants": {
+            "creds": "Afficher tous les identifiants actuellement configurés (session unique et multiples).",
+            "clear creds": "Effacer tous les identifiants configurés (session unique et multiples)."
+        },
+        "Actions d'Exploration et Tests": {
+            "smb": "Explorer les services SMB détectés (partages, sessions nulles, etc.).",
+            "ldap": "Explorer les services LDAP/LDAPS détectés (requêtes, AS-REP Roasting, etc.).",
+            "discoverusers": "Tenter différentes techniques de découverte d'utilisateurs.",
+            "testcreds": "Lancer une batterie de tests d'authentification avec les identifiants multiples configurés."
+        }
     }
 
     # Dictionnaire pour NestedCompleter (toutes les commandes de premier niveau ont None comme valeur)
+    # Ce dictionnaire doit refléter la structure des commandes utilisables.
     target_commands_completer_dict = {
         "help": None,
-        "prelim_scan": None,
-        "smb": None,
-        "ldap": None,
-        "discoverusers": None,
         "services": None,
+        "prelim_scan": None,
+        "smb": None, 
+        "ldap": None, 
+        "discoverusers": None,
+        "testcreds": None,
         "set": {
             "user": None,
             "password": None,
             "domain": None,
             "users": None,
-            "usersfile": None,
+            "usersfile": None, # Pourrait bénéficier d'un PathCompleter
             "passwords": None,
-            "passwordsfile": None,
+            "passwordsfile": None, # Pourrait bénéficier d'un PathCompleter
             "hashes": None,
-            "hashesfile": None,
+            "hashesfile": None # Pourrait bénéficier d'un PathCompleter
         },
         "creds": None,
         "clear": {
