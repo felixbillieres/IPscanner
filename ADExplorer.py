@@ -149,150 +149,75 @@ def format_status(success, text_if_success="Succès", text_if_failure="Échec"):
 def run_preliminary_scan(target_ip, scanned_ports_info, session):
     """Effectue une série d'énumérations préliminaires rapides et affiche un tableau de statut."""
     logging.info(f"Exécution du scan préliminaire sur {target_ip}")
-    print(f"\n{AnsiColors.CYAN}[*] Scan préliminaire Active Directory pour {AnsiColors.YELLOW}{target_ip}{AnsiColors.ENDC}:{AnsiColors.ENDC}")
+    print(f"\n[*] Scan préliminaire Active Directory pour {target_ip}:")
 
     results = []
-    nxc_exec = NXC_CMD
 
-    # 1. Test de connexion anonyme LDAP et récupération du contexte de nommage
-    ldap_status = {"text": "LDAP Anonyme (389/636)", "status": format_status(False), "details": "NXC non disponible ou test échoué"}
-    if NXC_AVAILABLE:
-        # Tenter sur LDAPS d'abord si le port est ouvert, sinon LDAP
-        ldap_target_protocol = "ldap"
-        prelim_ldap_port_to_use = ""
+    # 1. Test de connexion LDAP anonyme
+    ldap_anon_success = False
+    ldap_domain_name = "N/A"
+    # Vérifier si le port LDAP est ouvert avant de tester
+    if 389 in scanned_ports_info.get("LDAP", []): # Accès corrigé
+        print("[*] Test de la liaison LDAP anonyme...")
+        # Utilisation de nxc pour une tentative de connexion anonyme simple
+        # et récupération du nom de domaine si possible.
+        # La commande exacte peut varier ou nécessiter des ajustements.
+        # nxc ldap <target> -u '' -p '' --trusted-domain
+        # ou nxc ldap <target> -u '' -p '' --namingcontexts
+        cmd_ldap_anon = [NXC_CMD, "ldap", target_ip, "-u", "''", "-p", "''", "--trusted-domain"]
+        output, ret_code = run_command(cmd_ldap_anon)
+        if output and "DOMAIN" in output.upper(): # Chercher un indicateur de succès
+            ldap_anon_success = True
+            # Essayer d'extraire le nom de domaine (simpliste)
+            match = re.search(r"Domain:\s*([\w.-]+)", output, re.IGNORECASE)
+            if match:
+                ldap_domain_name = match.group(1)
+            elif "dnsdomainname" in output.lower(): # Autre tentative
+                 match_dns = re.search(r"dnsdomainname:\s*([\w.-]+)", output, re.IGNORECASE)
+                 if match_dns:
+                     ldap_domain_name = match_dns.group(1)
 
-        if 636 in scanned_ports_info.get("LDAPS", {}).get("ports", []):
-            ldap_target_protocol = "ldaps"
-            prelim_ldap_port_to_use = ":636"
-        elif 3269 in scanned_ports_info.get("GlobalCatalog_LDAPS", {}).get("ports", []):
-            ldap_target_protocol = "ldaps" # GC LDAPS
-            prelim_ldap_port_to_use = ":3269"
-        elif 389 in scanned_ports_info.get("LDAP", {}).get("ports", []):
-            ldap_target_protocol = "ldap"
-            prelim_ldap_port_to_use = ":389"
-        elif 3268 in scanned_ports_info.get("GlobalCatalog_LDAP", {}).get("ports", []):
-            ldap_target_protocol = "ldap" # GC LDAP
-            prelim_ldap_port_to_use = ":3268"
+    results.append(("LDAP Anonyme", ldap_anon_success, f"Domaine: {ldap_domain_name}" if ldap_anon_success else "Échec de la liaison ou infos non trouvées"))
 
+    # 2. Test de connexion SMB anonyme (Null Session) & Listage des partages
+    smb_anon_success = False
+    smb_shares_count = 0
+    if 445 in scanned_ports_info.get("SMB", []): # Accès corrigé
+        print("[*] Test de la session SMB nulle et listage des partages...")
+        cmd_smb_null = [NXC_CMD, "smb", target_ip, "-u", "", "-p", "", "--shares"]
+        output, ret_code = run_command(cmd_smb_null)
+        if output and "READ" in output.upper() or "WRITE" in output.upper(): # Un indicateur que des partages ont été listés
+            smb_anon_success = True # Considérer comme un succès si la commande s'exécute et liste quelque chose
+            smb_shares_count = len(re.findall(r"^\s*([\w\-$]+)\s+", output, re.MULTILINE)) # Compte approximatif
 
-        if prelim_ldap_port_to_use:
-            cmd = [nxc_exec, ldap_target_protocol, target_ip, "-u", "", "-p", "", "--timeout", "10"] # Timeout pour nxc
-            # Pour obtenir le naming context, nxc l'affiche souvent par défaut lors d'une connexion réussie.
-            # Ou on peut utiliser --info mais c'est un module payant.
-            # Une simple connexion suffit pour le test.
-            output, error_output = run_command(cmd, timeout=15, suppress_errors=True) # Augmenter un peu le timeout pour nxc
-            
-            if output and "Pwn3d!" not in output and "ERROR" not in output.upper() and "FAILURE" not in output.upper() : # nxc peut être verbeux
-                # Chercher des indicateurs de succès comme le nom de domaine
-                domain_match = re.search(r"Domain:\s*([\w.-]+)", output, re.IGNORECASE)
-                dns_domain_match = re.search(r"DNS Domain:\s*([\w.-]+)", output, re.IGNORECASE)
-                forest_match = re.search(r"Forest:\s*([\w.-]+)", output, re.IGNORECASE)
-                
-                details_str = ""
-                if domain_match: details_str += f"Domaine: {domain_match.group(1)} "
-                if dns_domain_match and (not domain_match or dns_domain_match.group(1) != domain_match.group(1)):
-                    details_str += f"DNS Domaine: {dns_domain_match.group(1)} "
-                if forest_match: details_str += f"Forêt: {forest_match.group(1)}"
-
-                if not details_str and "LDAP connection successful" in output: # Autre indicateur possible
-                     details_str = "Connexion LDAP anonyme réussie."
-
-                if details_str:
-                    ldap_status["status"] = format_status(True)
-                    ldap_status["details"] = details_str.strip()
-                else:
-                    ldap_status["details"] = "Connexion anonyme LDAP possible mais infos de domaine non extraites."
-                    # On peut considérer cela comme un demi-succès
-                    if "Guest session" in output or "Anonymous" in output : # nxc peut indiquer une session anonyme
-                         ldap_status["status"] = format_status(True, "Partiel", "Partiel")
-
-
-            elif error_output:
-                 ldap_status["details"] = f"Échec (nxc: {error_output.splitlines()[0] if error_output else 'erreur inconnue'})"
-            else:
-                 ldap_status["details"] = "Échec de la connexion LDAP anonyme ou pas d'infos."
-        else:
-            ldap_status["details"] = "Ports LDAP/LDAPS (389,636,3268,3269) non ouverts."
-
-    results.append(ldap_status)
-
-    # 2. Test de connexion anonyme SMB et listage des partages
-    smb_status = {"text": "SMB Anonyme & Partages (445)", "status": format_status(False), "details": "NXC non disponible ou test échoué"}
-    if NXC_AVAILABLE and 445 in scanned_ports_info.get("SMB", {}).get("ports", []):
-        cmd_smb = [nxc_exec, "smb", target_ip, "-u", "", "-p", "", "--shares", "--timeout", "10"]
-        output_smb, error_smb = run_command(cmd_smb, timeout=15, suppress_errors=True)
-        
-        if output_smb and "Pwn3d!" not in output_smb and "ERROR" not in output_smb.upper():
-            if "Guest session" in output_smb or "Anonymous" in output_smb or re.search(r"READ\s+WRITE", output_smb): # Indicateurs de succès
-                smb_status["status"] = format_status(True)
-                shares = []
-                for line in output_smb.splitlines():
-                    if ("READ" in line or "WRITE" in line) and "$" not in line: # Partages accessibles non administratifs
-                        share_name_match = re.match(r"\s*([\w-]+)\s+", line.strip())
-                        if share_name_match:
-                            shares.append(share_name_match.group(1))
-                if shares:
-                    smb_status["details"] = f"Partages trouvés: {', '.join(list(set(shares))[:3])}" # Afficher quelques partages
-                else:
-                    smb_status["details"] = "Session nulle SMB réussie, aucun partage notable listé."
-            else:
-                smb_status["details"] = "Session nulle SMB possible mais pas de partages clairs ou erreur."
-
-        elif error_smb:
-            smb_status["details"] = f"Échec (nxc: {error_smb.splitlines()[0] if error_smb else 'erreur inconnue'})"
-        else:
-            smb_status["details"] = "Échec de la connexion SMB anonyme ou pas de partages."
-    elif not (445 in scanned_ports_info.get("SMB", {}).get("ports", [])):
-        smb_status["details"] = "Port SMB (445) non ouvert."
-    results.append(smb_status)
-
-    # 3. Statut des ports AD courants
+    results.append(("SMB Anonyme (Shares)", smb_anon_success, f"{smb_shares_count} partages listés" if smb_anon_success and smb_shares_count > 0 else ("Session nulle possible mais pas de partages listés" if smb_anon_success else "Échec session nulle")))
+    
+    # 3. Vérification des ports AD courants (basé sur scanned_ports_info)
+    # scanned_ports_info est déjà le dictionnaire { "SERVICE": [ports] }
     ad_ports_to_check = {
-        "DNS (53 TCP/UDP)": ("DNS", [53]),
-        "Kerberos (88 TCP/UDP)": ("Kerberos", [88]),
-        "RPC Mapper (135 TCP)": ("RPC_Mapper", [135]),
-        "NetBIOS-SSN (139 TCP)": ("SMB", [139]), # Souvent lié à SMB
-        # LDAP/SMB/LDAPS déjà couverts plus spécifiquement
-        "Kerberos Pwd (464 TCP/UDP)": ("Kerberos", [464]), # Moins courant à trouver ouvert de l'extérieur
-        "WinRM HTTP (5985 TCP)": ("WinRM_HTTP", [5985]),
-        "WinRM HTTPS (5986 TCP)": ("WinRM_HTTPS", [5986]),
+        "LDAP (389)": ("LDAP", 389),
+        "LDAPS (636)": ("LDAPS", 636),
+        "SMB (445)": ("SMB", 445), # 139 est aussi SMB mais 445 est plus courant pour AD moderne
+        "Kerberos (88)": ("Kerberos", 88),
+        "DNS (53)": ("DNS", 53),
+        "GlobalCatalog LDAP (3268)": ("GlobalCatalog_LDAP", 3268),
+        "GlobalCatalog LDAPS (3269)": ("GlobalCatalog_LDAPS", 3269),
+        "RPC Mapper (135)": ("RPC_Mapper", 135),
     }
 
-    for desc, (service_key, port_numbers) in ad_ports_to_check.items():
-        port_open = False
-        # scanned_ports_info est comme: {'SMB': {'ports': [139, 445], 'status': 'open'}, ...}
-        # ou {'DNS': {'ports': [53], 'status': 'open', 'protocol': 'tcp'}, ...}
-        # La structure de scanned_ports_info doit être cohérente.
-        # Supposons que SERVICE_PORTS est utilisé pour le scan initial et que scanned_ports_info reflète cela.
-        
-        service_data = scanned_ports_info.get(service_key)
-        if service_data and service_data.get('status') == 'open':
-            # Vérifier si l'un des ports spécifiques est dans la liste des ports ouverts pour ce service
-            if any(p in service_data.get('ports', []) for p in port_numbers):
-                port_open = True
-        
-        results.append({
-            "text": desc,
-            "status": format_status(port_open, "Ouvert", "Fermé/Non trouvé"),
-            "details": ""
-        })
+    for display_name, (service_key, port_num) in ad_ports_to_check.items():
+        is_open = port_num in scanned_ports_info.get(service_key, []) # Accès corrigé
+        results.append((display_name, is_open, "Ouvert" if is_open else "Fermé/Non détecté"))
 
     # Affichage du tableau
-    print(f"\n  {AnsiColors.BOLD}Résultats du Scan Préliminaire:{AnsiColors.ENDC}")
-    # Simple table format
-    header_format = "| {<35} | {<25} | {}"
-    row_format    = "| {<35} | {<25} | {}"
-    print("-" * 80)
-    print(header_format.format("Test", "Statut", "Détails"))
-    print("-" * 80)
-    for res in results:
-        # Tronquer les détails si trop longs pour l'affichage console
-        details_display = res['details']
-        if len(details_display) > 40: # Ajuster la longueur max des détails
-            details_display = details_display[:37] + "..."
-        print(row_format.format(res['text'], res['status'], details_display))
-    print("-" * 80)
-    print("\n")
+    print("\n--- Tableau de Statut Préliminaire ---")
+    max_test_len = max(len(r[0]) for r in results) if results else 20
+    print(f"{'Test':<{max_test_len}} | {'Statut':<8} | {'Détails'}")
+    print(f"{'-'*(max_test_len)} | {'-'*8} | {'-'*20}")
+    for test_name, status, detail in results:
+        status_str = format_status(status, "OK", "FAIL")
+        print(f"{test_name:<{max_test_len}} | {status_str:<18} | {detail}") # Ajuster la largeur de status_str si besoin
+    print("--- Fin du Tableau ---")
 
 # --- Fonctions de Scan ---
 def check_port(ip, port, open_ports_list, service_name):
@@ -1100,17 +1025,27 @@ def main_loop(target_ip, scanned_ports, session):
             elif command == "prelim_scan":
                 run_preliminary_scan(target_ip, scanned_ports, session)
             elif command == "smb":
-                smb_ports = scanned_ports.get("SMB", {}).get("ports", [])
-                if not smb_ports:
-                    print("Usage: smb <service_name>")
+                smb_ports_list = scanned_ports.get("SMB", []) # Récupérer la liste des ports SMB
+                if not smb_ports_list:
+                    # Correction: Le message d'erreur était incorrect.
+                    # Il n'y a pas de <service_name> à passer ici.
+                    # La commande 'smb' explore les ports SMB déjà identifiés.
+                    print(f"[-] Aucun port SMB (139, 445) n'a été détecté sur {target_ip}.")
+                    logging.warning(f"Tentative d'exploration SMB sans ports SMB détectés pour {target_ip}")
                     continue
-                explore_smb(target_ip, smb_ports, session)
+                explore_smb(target_ip, smb_ports_list, session)
             elif command == "ldap":
-                ldap_ports = scanned_ports.get("LDAP", {}).get("ports", [])
-                if not ldap_ports:
-                    print("Usage: ldap <service_name>")
+                ldap_ports_list = scanned_ports.get("LDAP", []) # Récupérer la liste des ports LDAP
+                ldaps_ports_list = scanned_ports.get("LDAPS", []) # Et LDAPS
+                
+                combined_ldap_ports = ldap_ports_list + ldaps_ports_list
+                
+                if not combined_ldap_ports:
+                    # Message d'erreur corrigé
+                    print(f"[-] Aucun port LDAP (389) ou LDAPS (636) n'a été détecté sur {target_ip}.")
+                    logging.warning(f"Tentative d'exploration LDAP sans ports LDAP/LDAPS détectés pour {target_ip}")
                     continue
-                explore_ldap(target_ip, ldap_ports, session)
+                explore_ldap(target_ip, combined_ldap_ports, session) # Passer tous les ports LDAP/S
             elif command == "discoverusers":
                 user_discovery_mode(target_ip, session)
             elif command == "services":
