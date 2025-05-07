@@ -9,6 +9,18 @@ from queue import Queue
 from urllib.parse import urlparse, urljoin
 from urllib.robotparser import RobotFileParser
 
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.completion import WordCompleter, PathCompleter
+    from prompt_toolkit.validation import Validator, ValidationError
+    from prompt_toolkit.styles import Style as PromptStyle
+except ImportError:
+    print("Erreur: La librairie 'prompt_toolkit' n'est pas installée.")
+    print("Veuillez l'installer avec : pip install prompt_toolkit")
+    sys.exit(1)
+
 # --- Configuration Globale ---
 DEFAULT_THREADS = 10
 DEFAULT_WORDLIST = "wordlist.txt"

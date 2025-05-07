@@ -10,6 +10,18 @@ import shutil
 import sys
 import re
 
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.completion import WordCompleter
+    from prompt_toolkit.validation import Validator, ValidationError
+    from prompt_toolkit.styles import Style as PromptStyle
+except ImportError:
+    print("Erreur: La librairie 'prompt_toolkit' n'est pas installée.")
+    print("Veuillez l'installer avec : pip install prompt_toolkit")
+    sys.exit(1)
+
 # --- Couleurs ANSI ---
 class Colors:
     GREEN = '\033[92m'
@@ -317,32 +329,70 @@ def run_httpx(subdomains):
             os.remove(tmp_file_path)
             print_info(f"Fichier temporaire {tmp_file_path} supprimé.")
 
-def main():
-    parser = argparse.ArgumentParser(description="Découverte de sous-domaines à partir d'une adresse IP.")
-    parser.add_argument("ip_address", help="L'adresse IP cible.")
-    parser.add_argument("--no-color", action="store_true", help="Désactiver la sortie colorée.")
-    args = parser.parse_args()
+class IPAddressValidator(Validator):
+    def validate(self, document):
+        text = document.text
+        if not text: # Permettre de passer si vide pour utiliser une valeur par défaut potentielle ou re-demander
+            return
+        # Simple validation pour IPv4, peut être étendue pour IPv6 ou noms d'hôte si nécessaire
+        parts = text.split('.')
+        if len(parts) == 4:
+            for item in parts:
+                if not item.isdigit() or not 0 <= int(item) <= 255:
+                    raise ValidationError(message='Adresse IP invalide.', cursor_position=len(text))
+        else:
+            # Permettre les noms d'hôte qui pourraient être résolus plus tard
+            # ou considérer ceci comme une erreur si seule une IP est attendue.
+            # Pour ce script, une IP est attendue pour le reverse DNS initial.
+            # On pourrait ajouter une résolution DNS ici pour valider un nom d'hôte.
+            pass # Accepter les noms d'hôtes pour l'instant, la logique métier gérera la résolution
 
-    if args.no_color:
-        Colors.NO_COLOR_MODE = True
+def get_boolean_input(session, prompt_message, default=True):
+    completer = WordCompleter(['oui', 'non', 'o', 'n'], ignore_case=True)
+    while True:
+        try:
+            text = session.prompt(
+                prompt_message,
+                completer=completer,
+                auto_suggest=AutoSuggestFromHistory(),
+                default='o' if default else 'n'
+            ).strip().lower()
+            if text in ['oui', 'o']:
+                return True
+            elif text in ['non', 'n']:
+                return False
+            else:
+                print_warning("Veuillez répondre par 'oui' (o) ou 'non' (n).")
+        except KeyboardInterrupt:
+            print_info("\nSaisie annulée.")
+            return None # Ou lever l'exception pour quitter
+        except EOFError:
+            print_info("\nSaisie annulée (EOF).")
+            return None # Ou lever l'exception pour quitter
 
-    ip_address = args.ip_address
+
+def run_domain_scan_logic(ip_address, no_color_flag):
+    """
+    Encapsule la logique principale du scan de domaine.
+    Prend les paramètres nécessaires en arguments.
+    """
+    Colors.NO_COLOR_MODE = no_color_flag
+    
     print_info(f"Adresse IP cible: {Colors.YELLOW}{ip_address}{Colors.ENDC}")
 
-    # Vérifier les outils requis
     if not check_tool_installed("subfinder") or not check_tool_installed("httpx"):
-        sys.exit(1)
+        return # Les messages d'erreur sont déjà affichés par check_tool_installed
 
     domain_name = reverse_dns_lookup(ip_address)
     if not domain_name:
         print_error("Impossible de continuer sans nom de domaine.")
-        sys.exit(1)
+        return
     
     print_success(f"Nom de domaine principal sélectionné: {Colors.GREEN}{domain_name}{Colors.ENDC}")
 
     hosts_modified = False
     if modify_hosts_file(ip_address, domain_name, add_entry=True):
-        hosts_modified = True # Indique que l'entrée a été ajoutée ou était déjà là
+        hosts_modified = True
 
     subdomains_found = run_subfinder(domain_name)
     httpx_output = None
@@ -364,7 +414,6 @@ def main():
     else:
         print_info(f"Le fichier {HOSTS_FILE_PATH} n'a pas été modifié (privilèges root non détectés ou action non confirmée).")
 
-
     if subdomains_found:
         print_success(f"Sous-domaines découverts par Subfinder ({len(subdomains_found)}):")
         for sd in subdomains_found:
@@ -373,7 +422,7 @@ def main():
     else:
         print_warning("Aucun sous-domaine n'a été découvert.")
 
-    if httpx_output: # httpx_output contient les lignes brutes
+    if httpx_output:
         print_success("Informations Httpx (re-traitées pour couleur):")
         regex_report = re.compile(r"^(https?://[^ ]+)\s*\[(\d{3}),(.*?),(.+?),(.*?)\]$")
         for res_line in httpx_output:
@@ -396,13 +445,11 @@ def main():
                     print(f"  {Colors.WHITE}{url}{Colors.ENDC} [{colored_status},{Colors.CYAN}{title}{Colors.ENDC},{Colors.MAGENTA}{server}{Colors.ENDC},{Colors.BLUE}{tech}{Colors.ENDC}]")
             else:
                 if Colors.NO_COLOR_MODE: print(f"  {res_line}")
-                else: print(f"  {Colors.GRAY}{res_line}{Colors.ENDC}")
+                else: print(f"  {Colors.GRAY}{res_line}{Colors.ENDC}") # Ligne non parsée
     elif subdomains_found:
         print_warning("Aucune information n'a été collectée par Httpx pour les sous-domaines trouvés.")
 
-
-    # Nettoyage optionnel de /etc/hosts
-    if hosts_modified and is_sudo(): # Proposer uniquement si ajouté par ce script avec sudo
+    if hosts_modified and is_sudo():
         print_info(f"\nL'entrée {ip_address} {domain_name} a été ajoutée à {HOSTS_FILE_PATH}.")
         if input("Souhaitez-vous supprimer cette entrée de /etc/hosts maintenant? (O/n): ").strip().lower() in ['o', '']:
             modify_hosts_file(ip_address, domain_name, add_entry=False)
@@ -411,8 +458,65 @@ def main():
     elif hosts_modified and not is_sudo():
         print_info(f"\nSi vous avez ajouté l'entrée à {HOSTS_FILE_PATH} manuellement, n'oubliez pas de la nettoyer si nécessaire.")
 
+    print_info("Fin du scan de domaine.")
 
-    print_info("Fin du script.")
+
+def interactive_main():
+    session = PromptSession(history=FileHistory('.domainscanner_history'))
+    
+    # Style pour prompt_toolkit (optionnel, peut être étendu)
+    style = PromptStyle.from_dict({
+        'prompt': 'ansiblue bold',
+        '': '#ffffff', # Default text
+    })
+
+    print_info("Bienvenue dans DomainScanner Interactif!")
+    print_info("Tapez Ctrl-C ou Ctrl-D pour quitter à tout moment lors d'une invite.")
+
+    while True:
+        try:
+            target_ip = session.prompt(
+                "Entrez l'adresse IP cible: ",
+                validator=IPAddressValidator(),
+                validate_while_typing=False,
+                auto_suggest=AutoSuggestFromHistory(),
+                style=style
+            ).strip()
+            if not target_ip:
+                print_warning("L'adresse IP est requise.")
+                continue
+
+            use_color_input = get_boolean_input(session, "Activer la sortie colorée? (O/n): ", default=True)
+            if use_color_input is None: # Ctrl-C/D dans get_boolean_input
+                break 
+            no_color = not use_color_input
+
+            run_domain_scan_logic(target_ip, no_color)
+
+        except KeyboardInterrupt:
+            print_info("\nScan interrompu par l'utilisateur.")
+            break
+        except EOFError:
+            print_info("\nFin de la saisie. Au revoir!")
+            break
+        
+        try:
+            if session.prompt("Lancer un autre scan? (O/n): ", default="o").strip().lower() not in ['o', 'oui']:
+                break
+        except (KeyboardInterrupt, EOFError):
+            break
+            
+    print_info("DomainScanner Interactif terminé.")
 
 if __name__ == "__main__":
-    main() 
+    # Commenter ou supprimer l'ancien argparse
+    # parser = argparse.ArgumentParser(description="Découverte de sous-domaines à partir d'une adresse IP.")
+    # parser.add_argument("ip_address", help="L'adresse IP cible.")
+    # parser.add_argument("--no-color", action="store_true", help="Désactiver la sortie colorée.")
+    # args = parser.parse_args()
+    #
+    # if args.no_color:
+    #     Colors.NO_COLOR_MODE = True
+    #
+    # run_domain_scan_logic(args.ip_address, args.no_color)
+    interactive_main() 
