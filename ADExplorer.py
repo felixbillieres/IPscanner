@@ -995,6 +995,18 @@ def display_help():
     print("  log                 - Afficher le chemin du fichier de log.")
     print("  exit                - Quitter l'application.")
 
+def print_target_menu(commands_dict):
+    """Affiche le menu des commandes pour une cible."""
+    print("\nCommandes disponibles pour la cible actuelle:")
+    # Trouver la longueur maximale de la clé de commande pour l'alignement
+    max_key_len = 0
+    if commands_dict: # S'assurer que le dictionnaire n'est pas vide
+        max_key_len = max(len(key) for key in commands_dict.keys())
+    
+    for command, description in commands_dict.items():
+        print(f"  {AnsiColors.YELLOW}{command:<{max_key_len}}{AnsiColors.ENDC}  -  {description}")
+    print("")
+
 def main_loop(target_ip, scanned_ports, session):
     """Boucle principale pour interagir avec une cible."""
     logging.info(f"Entrée dans la boucle principale pour {target_ip}. Ports scannés: {scanned_ports}")
@@ -1078,6 +1090,10 @@ def main_loop(target_ip, scanned_ports, session):
             if command == "exit":
                 logging.info("Sortie de l'application.")
                 print("Au revoir !")
+                break
+            elif command == "back":
+                logging.info(f"Retour demandé depuis {target_ip}. Dans ce contexte, cela quitte la session cible.")
+                print("Retour... (quitte la session cible actuelle)")
                 break
             elif command == "help":
                 print_target_menu(target_commands_help) # Utiliser le dictionnaire d'aide ici
