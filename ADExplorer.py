@@ -1286,81 +1286,90 @@ def generate_and_append_etc_hosts(subnet_cidr, no_color_mode=False):
         print(f"{AnsiColors.RED}[-] NetExec (nxc) n'est pas disponible. Impossible de découvrir les hôtes.{AnsiColors.ENDC}")
         return
 
-    print(f"[*] Découverte des hôtes actifs sur {subnet_cidr} avec nxc...")
-    # Utiliser nxc pour un ping sweep. L'option --ping n'existe pas directement,
-    # mais nxc sur un range sans module spécifique fait un host discovery.
-    # On peut aussi utiliser un module léger comme 'smb' et regarder les hôtes qui répondent.
-    # Pour un simple ping sweep, nxc <cidr> sans module est souvent suffisant pour voir les hôtes UP.
-    # Ou, plus explicitement, on peut utiliser un module qui liste les hôtes.
-    # Ici, on va juste lancer nxc sur le range et parser les IPs qui sont marquées comme UP.
+    print(f"[*] Découverte des hôtes actifs et de leurs noms sur {subnet_cidr} avec 'nxc smb'...")
+    # Utiliser nxc smb <subnet> pour la découverte.
+    # La sortie ressemble à:
+    # SMB         10.10.11.41     445    DC01             [*] Windows 10 / Server 2019 Build 17763 x64 (name:DC01) (domain:certified.htb) (signing:True) (SMBv1:False)
+    # SMB         10.10.11.35     445    CICADA-DC        [*] Windows Server 2022 Build 20348 x64 (name:CICADA-DC) (domain:cicada.htb) (signing:True) (SMBv1:False)
     
-    # Alternative: nxc <cidr> smb --shares (juste pour voir les hosts up, même si shares échoue)
-    # Pour l'instant, on va supposer que nxc <cidr> seul liste les hôtes UP.
-    # Une meilleure approche serait d'utiliser nmap si disponible, ou un ping sweep plus dédié.
-    # Pour nxc, on peut utiliser un module simple et regarder les logs ou la sortie.
-    # Exemple avec le module 'ping' (si nxc le supporte directement, sinon on adapte)
-    # cmd_discover = [NXC_CMD, subnet_cidr, "ping"] # Si nxc a un module ping
-    # Pour l'instant, on va utiliser une approche plus générique avec nxc
-    
-    cmd_discover = [NXC_CMD, subnet_cidr] # Lance nxc sur le range, il devrait lister les hôtes UP
-    output, ret_code = run_command(cmd_discover)
+    cmd_discover = [NXC_CMD, "smb", subnet_cidr]
+    # Nous avons besoin de capturer la sortie pour la parser.
+    # La fonction run_command actuelle affiche en temps réel ET retourne la sortie.
+    raw_output, ret_code = run_command(cmd_discover, capture_output=True)
 
-    if ret_code != 0 or not output:
-        print(f"{AnsiColors.RED}[-] Échec de la découverte d'hôtes ou aucun hôte trouvé.{AnsiColors.ENDC}")
+    if ret_code != 0 and not raw_output: # Si nxc échoue et ne donne aucune sortie
+        print(f"{AnsiColors.RED}[-] Échec de la commande de découverte d'hôtes nxc.{AnsiColors.ENDC}")
+        return
+    
+    if not raw_output:
+        print(f"[-] Aucune sortie de la commande de découverte nxc pour {subnet_cidr}.")
         return
 
-    active_ips = []
-    # Parser la sortie de nxc pour les IPs. Ceci dépendra du format de sortie de nxc.
-    # Supposons que nxc affiche les IPs actives d'une manière identifiable.
-    # Exemple de parsing (à adapter selon la sortie réelle de `nxc <subnet_cidr>`)
-    for line in output.splitlines():
-        # Chercher les lignes qui indiquent un hôte actif, souvent avec l'IP.
-        # Ceci est une heuristique et pourrait nécessiter un ajustement.
-        # Par exemple, si nxc affiche "[*] IP_ADDRESS - Host is alive"
-        match_ip = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", line)
-        if match_ip and "UP" in line.upper() or "ALIVE" in line.upper() or "SMB" in line or "LDAP" in line : # Heuristique
-            ip = match_ip.group(1)
-            if ip not in active_ips:
-                active_ips.append(ip)
-    
-    if not active_ips:
-        print(f"[-] Aucun hôte actif détecté sur {subnet_cidr} via nxc.")
-        return
+    host_entries_data = [] # Va stocker des tuples (ip, hostname, domain)
 
-    print(f"[*] Hôtes actifs trouvés sur {subnet_cidr}: {', '.join(active_ips)}")
+    # Regex pour parser la ligne SMB de nxc
+    # Captures: IP, Nom d'hôte (NetBIOS), Nom d'hôte (détail), Domaine (détail)
+    # L'IP est la 2ème colonne, le nom d'hôte est la 4ème. Le domaine est dans les détails.
+    # Regex plus robuste pour la ligne SMB:
+    # SMB\s+([\d\.]+)\s+\d+\s+([^\s]+)\s+\[\*\](?:.*\(name:([^\)]+)\))?(?:.*\(domain:([^\)]+)\))?
+    # Groupe 1: IP
+    # Groupe 2: Nom d'hôte (colonne 4)
+    # Groupe 3: Nom d'hôte détaillé (optionnel)
+    # Groupe 4: Domaine détaillé (optionnel)
+
+    # Simplifions en se basant sur la structure des colonnes et le parsing des détails pour le domaine.
+    # La 4ème colonne est le nom d'hôte (ex: DC01).
+    # Le domaine est dans (domain:NOM_DOMAINE)
+    
+    parsed_ips = set() # Pour éviter les doublons si nxc liste plusieurs fois
+
+    for line in raw_output.splitlines():
+        line = line.strip()
+        if line.startswith("SMB"):
+            parts = re.split(r'\s+', line, maxsplit=4) # Divise sur les espaces, max 4 fois pour garder la fin
+            if len(parts) >= 4:
+                ip_address = parts[1]
+                hostname_short = parts[3] # Nom d'hôte de la 4ème colonne
+                
+                if ip_address in parsed_ips:
+                    continue
+                parsed_ips.add(ip_address)
+
+                domain_name = None
+                details_part = parts[4] if len(parts) > 4 else ""
+
+                domain_match = re.search(r"\(domain:([^\)]+)\)", details_part, re.IGNORECASE)
+                if domain_match:
+                    domain_name = domain_match.group(1)
+                
+                # Si le nom d'hôte de la 4ème colonne contient déjà le domaine, on l'utilise
+                if domain_name and hostname_short.lower().endswith("." + domain_name.lower()):
+                    fqdn = hostname_short
+                    hostname_short = fqdn.split('.')[0] # Recalculer le nom court
+                elif domain_name:
+                    fqdn = f"{hostname_short}.{domain_name}"
+                else:
+                    fqdn = hostname_short # Pas de domaine trouvé, on utilise le nom court comme FQDN
+                                        # On pourrait tenter une résolution inversée ici en fallback
+
+                host_entries_data.append({'ip': ip_address, 'fqdn': fqdn, 'shortname': hostname_short})
+                print(f"  [+] Détecté: IP={ip_address}, FQDN={fqdn}, Shortname={hostname_short}")
+
+    if not host_entries_data:
+        print(f"[-] Aucun hôte SMB valide trouvé ou parsé sur {subnet_cidr}.")
+        return
     
     etc_hosts_entries = []
-    print("[*] Tentative de résolution DNS inversée (peut prendre du temps)...")
-    for ip in active_ips:
-        hostname = None
-        try:
-            hostname, _, _ = socket.gethostbyaddr(ip)
-            print(f"  [+] {ip} -> {hostname}")
-        except socket.herror:
-            print(f"  [-] {ip} -> Échec de la résolution inversée.")
-            # Générer un nom d'hôte basé sur l'IP si le domaine est connu
-            domain_part = credentials.get("domain") or multi_credentials.get("domain")
-            if domain_part:
-                hostname_generated = f"host-{ip.replace('.', '-')}.{domain_part.lower()}"
-            else:
-                hostname_generated = f"unknown-{ip.replace('.', '-')}"
-            hostname = hostname_generated # Utiliser le nom généré
-            print(f"      Utilisation de nom généré: {hostname}")
-
-
-        if hostname:
-            # Créer une entrée simple et une avec le nom court si possible
-            short_name = hostname.split('.')[0]
-            if short_name != hostname:
-                etc_hosts_entries.append(f"{ip}\t{hostname}\t{short_name}")
-            else:
-                etc_hosts_entries.append(f"{ip}\t{hostname}")
-        else: # Fallback si même le nom généré n'est pas là (ne devrait pas arriver)
-             etc_hosts_entries.append(f"{ip}\tunknown-{ip.replace('.', '-')}")
-
+    for data in host_entries_data:
+        # Format: IP FQDN SHORTNAME
+        # Si FQDN et SHORTNAME sont identiques (pas de domaine), on met juste IP FQDN
+        if data['fqdn'].lower() == data['shortname'].lower():
+            etc_hosts_entries.append(f"{data['ip']}\t{data['fqdn']}")
+        else:
+            etc_hosts_entries.append(f"{data['ip']}\t{data['fqdn']}\t{data['shortname']}")
 
     if not etc_hosts_entries:
-        print("[-] Aucune entrée /etc/hosts à générer.")
+        print("[-] Aucune entrée /etc/hosts à générer après parsing.")
         return
 
     print("\n--- Entrées /etc/hosts proposées ---")
