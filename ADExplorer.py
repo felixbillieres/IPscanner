@@ -999,25 +999,45 @@ def main_loop(target_ip, scanned_ports, session):
     """Boucle principale pour interagir avec une cible."""
     logging.info(f"Entrée dans la boucle principale pour {target_ip}. Ports scannés: {scanned_ports}")
     
-    # Création du dictionnaire pour l'auto-complétion des commandes spécifiques à la cible
-    target_commands = {
+    # Dictionnaire des commandes pour l'affichage de l'aide
+    target_commands_help = {
         "help": "Afficher ce message d'aide.",
         "prelim_scan": "Effectuer un scan préliminaire rapide (LDAP/SMB anonyme, ports AD).",
-        "smb": "Explorer les services SMB.",
-        "ldap": "Explorer les services LDAP/LDAPS.",
-        "discoverusers": "Entrer en Mode Découverte d'Utilisateurs (SMB Null, LDAP Anon, Kerbrute).",
-        "services": "Afficher à nouveau les services détectés.",
+        "smb": "Explorer les services SMB (nécessite une cible SMB).",
+        "ldap": "Explorer les services LDAP/LDAPS (nécessite une cible LDAP).",
+        "discoverusers": "Tenter différentes techniques de découverte d'utilisateurs.",
+        "services": "Afficher les services détectés lors du scan initial.",
+        "set user <username>": "Définir le nom d'utilisateur pour les actions futures.",
+        "set password <password>": "Définir le mot de passe pour les actions futures.",
+        "set domain <domain>": "Définir le domaine pour les actions futures.",
+        "creds": "Afficher les identifiants actuellement configurés.",
+        "clear creds": "Effacer tous les identifiants configurés.",
+        "back": "Retourner au menu principal (si applicable, sinon quitte).",
+        "exit": "Quitter l'application."
+    }
+
+    # Dictionnaire pour NestedCompleter (toutes les commandes de premier niveau ont None comme valeur)
+    target_commands_completer_dict = {
+        "help": None,
+        "prelim_scan": None,
+        "smb": None, # Si SMB avait des sous-commandes, elles seraient ici
+        "ldap": None, # Idem pour LDAP
+        "discoverusers": None,
+        "services": None,
         "set": {
             "user": None,
             "password": None,
-            "domain": None,
+            "domain": None
         },
         "creds": None,
-        "clear": {"creds": None},
-        "exit": None,
+        "clear": {
+            "creds": None
+        },
+        "back": None,
+        "exit": None
     }
-
-    target_completer = NestedCompleter.from_nested_dict(target_commands)
+    
+    target_completer = NestedCompleter.from_nested_dict(target_commands_completer_dict)
 
     while True:
         prompt_text = f"ADExplorer ({AnsiColors.YELLOW}{target_ip}{AnsiColors.ENDC})> "
@@ -1053,38 +1073,38 @@ def main_loop(target_ip, scanned_ports, session):
 
             logging.info(f"Commande reçue: {user_input}")
             command_parts = user_input.lower().split()
-            cmd = command_parts[0]
+            command = command_parts[0]
 
-            if cmd == "exit":
+            if command == "exit":
                 logging.info("Sortie de l'application.")
                 print("Au revoir !")
                 break
-            elif cmd == "help":
-                print_target_menu(target_commands)
-            elif cmd == "prelim_scan":
+            elif command == "help":
+                print_target_menu(target_commands_help) # Utiliser le dictionnaire d'aide ici
+            elif command == "prelim_scan":
                 run_preliminary_scan(target_ip, scanned_ports, session)
-            elif cmd == "smb":
+            elif command == "smb":
                 smb_ports = scanned_ports.get("SMB", {}).get("ports", [])
                 if not smb_ports:
                     print("Usage: smb <service_name>")
                     continue
                 explore_smb(target_ip, smb_ports, session)
-            elif cmd == "ldap":
+            elif command == "ldap":
                 ldap_ports = scanned_ports.get("LDAP", {}).get("ports", [])
                 if not ldap_ports:
                     print("Usage: ldap <service_name>")
                     continue
                 explore_ldap(target_ip, ldap_ports, session)
-            elif cmd == "discoverusers":
+            elif command == "discoverusers":
                 user_discovery_mode(target_ip, session)
-            elif cmd == "services":
+            elif command == "services":
                 print("\n[+] Services potentiels détectés :")
                 if scanned_ports:
                     for service, ports in scanned_ports.items():
                         print(f"  - {service} (Ports: {', '.join(map(str, ports))})")
                 else:
                     print("  Aucun service n'a été détecté lors du scan initial.")
-            elif cmd == "set":
+            elif command == "set":
                 if len(command_parts) > 2:
                     cred_type = command_parts[1]
                     value = " ".join(command_parts[2:])
@@ -1105,13 +1125,13 @@ def main_loop(target_ip, scanned_ports, session):
                 else:
                     print("Usage: set <user|password|domain> <valeur>")
             
-            elif cmd == "creds":
+            elif command == "creds":
                 print("[*] Identifiants actuels :")
                 print(f"  Nom d'utilisateur : {credentials['username'] if credentials['username'] else 'Non défini'}")
                 print(f"  Mot de passe      : {'********' if credentials['password'] else 'Non défini'}")
                 print(f"  Domaine           : {credentials['domain'] if credentials['domain'] else 'Non défini'}")
 
-            elif cmd == "clear" and len(command_parts) > 1 and command_parts[1] == "creds":
+            elif command == "clear" and len(command_parts) > 1 and command_parts[1] == "creds":
                 credentials["username"] = None
                 credentials["password"] = None
                 credentials["domain"] = None
@@ -1119,7 +1139,7 @@ def main_loop(target_ip, scanned_ports, session):
                 logging.info("Identifiants effacés.")
             
             else:
-                print(f"Commande inconnue: {cmd}. Tapez 'help' pour la liste des commandes.")
+                print(f"Commande inconnue: {command}. Tapez 'help' pour la liste des commandes.")
 
         except KeyboardInterrupt:
             logging.warning("Sortie demandée par l'utilisateur (Ctrl+C)")
