@@ -10,6 +10,7 @@ import ipaddress
 import sys
 import subprocess
 import shutil
+import re
 
 try:
     from prompt_toolkit import PromptSession
@@ -57,6 +58,17 @@ cli_style = Style.from_dict({
     'bottom-toolbar': 'bg:#333333 #ffffff',
 })
 
+# --- Couleurs ANSI (pour la sortie non-prompt_toolkit) ---
+class AnsiColors:
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    YELLOW = '\033[93m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+    BOLD = '\033[1m'
+    ENDC = '\033[0m'
+    NO_COLOR_MODE = False
+
 # Gestionnaire d'identifiants (simple, pour la session en cours)
 # Dans une application réelle, envisager un stockage plus sécurisé si persistance nécessaire
 credentials = {
@@ -77,7 +89,17 @@ def check_command_exists(command):
 NXC_AVAILABLE = False
 RPCCLIENT_AVAILABLE = False
 KERBRUTE_AVAILABLE = False
+IMPACKET_EXAMPLES_AVAILABLE = False # Pour ldp.py etc.
 
+def get_nxc_executable():
+    """Retourne 'nxc' ou 'netexec' en fonction de ce qui est disponible."""
+    if shutil.which("nxc"):
+        return "nxc"
+    elif shutil.which("netexec"):
+        return "netexec"
+    return "nxc" # Par défaut, même si non trouvé, pour la construction de commandes
+
+NXC_CMD = get_nxc_executable()
 
 def run_command(command_list, shell=False, capture_output=True, text=True, check=False):
     """Exécute une commande externe et affiche sa sortie en temps réel."""
@@ -118,6 +140,159 @@ def run_command(command_list, shell=False, capture_output=True, text=True, check
         logging.error(f"Erreur lors de l'exécution de la commande '{command_str}': {e}")
         print(f"[-] Erreur lors de l'exécution: {e}")
         return None, -1
+
+def format_status(success, text_if_success="Succès", text_if_failure="Échec"):
+    if AnsiColors.NO_COLOR_MODE:
+        return f"[+] {text_if_success}" if success else f"[-] {text_if_failure}"
+    return f"{AnsiColors.GREEN}[+] {text_if_success}{AnsiColors.ENDC}" if success else f"{AnsiColors.RED}[-] {text_if_failure}{AnsiColors.ENDC}"
+
+def run_preliminary_scan(target_ip, scanned_ports_info, session):
+    """Effectue une série d'énumérations préliminaires rapides et affiche un tableau de statut."""
+    logging.info(f"Exécution du scan préliminaire sur {target_ip}")
+    print(f"\n{AnsiColors.CYAN}[*] Scan préliminaire Active Directory pour {AnsiColors.YELLOW}{target_ip}{AnsiColors.ENDC}:{AnsiColors.ENDC}")
+
+    results = []
+    nxc_exec = NXC_CMD
+
+    # 1. Test de connexion anonyme LDAP et récupération du contexte de nommage
+    ldap_status = {"text": "LDAP Anonyme (389/636)", "status": format_status(False), "details": "NXC non disponible ou test échoué"}
+    if NXC_AVAILABLE:
+        # Tenter sur LDAPS d'abord si le port est ouvert, sinon LDAP
+        ldap_target_protocol = "ldap"
+        prelim_ldap_port_to_use = ""
+
+        if 636 in scanned_ports_info.get("LDAPS", {}).get("ports", []):
+            ldap_target_protocol = "ldaps"
+            prelim_ldap_port_to_use = ":636"
+        elif 3269 in scanned_ports_info.get("GlobalCatalog_LDAPS", {}).get("ports", []):
+            ldap_target_protocol = "ldaps" # GC LDAPS
+            prelim_ldap_port_to_use = ":3269"
+        elif 389 in scanned_ports_info.get("LDAP", {}).get("ports", []):
+            ldap_target_protocol = "ldap"
+            prelim_ldap_port_to_use = ":389"
+        elif 3268 in scanned_ports_info.get("GlobalCatalog_LDAP", {}).get("ports", []):
+            ldap_target_protocol = "ldap" # GC LDAP
+            prelim_ldap_port_to_use = ":3268"
+
+
+        if prelim_ldap_port_to_use:
+            cmd = [nxc_exec, ldap_target_protocol, target_ip, "-u", "", "-p", "", "--timeout", "10"] # Timeout pour nxc
+            # Pour obtenir le naming context, nxc l'affiche souvent par défaut lors d'une connexion réussie.
+            # Ou on peut utiliser --info mais c'est un module payant.
+            # Une simple connexion suffit pour le test.
+            output, error_output = run_command(cmd, timeout=15, suppress_errors=True) # Augmenter un peu le timeout pour nxc
+            
+            if output and "Pwn3d!" not in output and "ERROR" not in output.upper() and "FAILURE" not in output.upper() : # nxc peut être verbeux
+                # Chercher des indicateurs de succès comme le nom de domaine
+                domain_match = re.search(r"Domain:\s*([\w.-]+)", output, re.IGNORECASE)
+                dns_domain_match = re.search(r"DNS Domain:\s*([\w.-]+)", output, re.IGNORECASE)
+                forest_match = re.search(r"Forest:\s*([\w.-]+)", output, re.IGNORECASE)
+                
+                details_str = ""
+                if domain_match: details_str += f"Domaine: {domain_match.group(1)} "
+                if dns_domain_match and (not domain_match or dns_domain_match.group(1) != domain_match.group(1)):
+                    details_str += f"DNS Domaine: {dns_domain_match.group(1)} "
+                if forest_match: details_str += f"Forêt: {forest_match.group(1)}"
+
+                if not details_str and "LDAP connection successful" in output: # Autre indicateur possible
+                     details_str = "Connexion LDAP anonyme réussie."
+
+                if details_str:
+                    ldap_status["status"] = format_status(True)
+                    ldap_status["details"] = details_str.strip()
+                else:
+                    ldap_status["details"] = "Connexion anonyme LDAP possible mais infos de domaine non extraites."
+                    # On peut considérer cela comme un demi-succès
+                    if "Guest session" in output or "Anonymous" in output : # nxc peut indiquer une session anonyme
+                         ldap_status["status"] = format_status(True, "Partiel", "Partiel")
+
+
+            elif error_output:
+                 ldap_status["details"] = f"Échec (nxc: {error_output.splitlines()[0] if error_output else 'erreur inconnue'})"
+            else:
+                 ldap_status["details"] = "Échec de la connexion LDAP anonyme ou pas d'infos."
+        else:
+            ldap_status["details"] = "Ports LDAP/LDAPS (389,636,3268,3269) non ouverts."
+
+    results.append(ldap_status)
+
+    # 2. Test de connexion anonyme SMB et listage des partages
+    smb_status = {"text": "SMB Anonyme & Partages (445)", "status": format_status(False), "details": "NXC non disponible ou test échoué"}
+    if NXC_AVAILABLE and 445 in scanned_ports_info.get("SMB", {}).get("ports", []):
+        cmd_smb = [nxc_exec, "smb", target_ip, "-u", "", "-p", "", "--shares", "--timeout", "10"]
+        output_smb, error_smb = run_command(cmd_smb, timeout=15, suppress_errors=True)
+        
+        if output_smb and "Pwn3d!" not in output_smb and "ERROR" not in output_smb.upper():
+            if "Guest session" in output_smb or "Anonymous" in output_smb or re.search(r"READ\s+WRITE", output_smb): # Indicateurs de succès
+                smb_status["status"] = format_status(True)
+                shares = []
+                for line in output_smb.splitlines():
+                    if ("READ" in line or "WRITE" in line) and "$" not in line: # Partages accessibles non administratifs
+                        share_name_match = re.match(r"\s*([\w-]+)\s+", line.strip())
+                        if share_name_match:
+                            shares.append(share_name_match.group(1))
+                if shares:
+                    smb_status["details"] = f"Partages trouvés: {', '.join(list(set(shares))[:3])}" # Afficher quelques partages
+                else:
+                    smb_status["details"] = "Session nulle SMB réussie, aucun partage notable listé."
+            else:
+                smb_status["details"] = "Session nulle SMB possible mais pas de partages clairs ou erreur."
+
+        elif error_smb:
+            smb_status["details"] = f"Échec (nxc: {error_smb.splitlines()[0] if error_smb else 'erreur inconnue'})"
+        else:
+            smb_status["details"] = "Échec de la connexion SMB anonyme ou pas de partages."
+    elif not (445 in scanned_ports_info.get("SMB", {}).get("ports", [])):
+        smb_status["details"] = "Port SMB (445) non ouvert."
+    results.append(smb_status)
+
+    # 3. Statut des ports AD courants
+    ad_ports_to_check = {
+        "DNS (53 TCP/UDP)": ("DNS", [53]),
+        "Kerberos (88 TCP/UDP)": ("Kerberos", [88]),
+        "RPC Mapper (135 TCP)": ("RPC_Mapper", [135]),
+        "NetBIOS-SSN (139 TCP)": ("SMB", [139]), # Souvent lié à SMB
+        # LDAP/SMB/LDAPS déjà couverts plus spécifiquement
+        "Kerberos Pwd (464 TCP/UDP)": ("Kerberos", [464]), # Moins courant à trouver ouvert de l'extérieur
+        "WinRM HTTP (5985 TCP)": ("WinRM_HTTP", [5985]),
+        "WinRM HTTPS (5986 TCP)": ("WinRM_HTTPS", [5986]),
+    }
+
+    for desc, (service_key, port_numbers) in ad_ports_to_check.items():
+        port_open = False
+        # scanned_ports_info est comme: {'SMB': {'ports': [139, 445], 'status': 'open'}, ...}
+        # ou {'DNS': {'ports': [53], 'status': 'open', 'protocol': 'tcp'}, ...}
+        # La structure de scanned_ports_info doit être cohérente.
+        # Supposons que SERVICE_PORTS est utilisé pour le scan initial et que scanned_ports_info reflète cela.
+        
+        service_data = scanned_ports_info.get(service_key)
+        if service_data and service_data.get('status') == 'open':
+            # Vérifier si l'un des ports spécifiques est dans la liste des ports ouverts pour ce service
+            if any(p in service_data.get('ports', []) for p in port_numbers):
+                port_open = True
+        
+        results.append({
+            "text": desc,
+            "status": format_status(port_open, "Ouvert", "Fermé/Non trouvé"),
+            "details": ""
+        })
+
+    # Affichage du tableau
+    print(f"\n  {AnsiColors.BOLD}Résultats du Scan Préliminaire:{AnsiColors.ENDC}")
+    # Simple table format
+    header_format = "| {<35} | {<25} | {}"
+    row_format    = "| {<35} | {<25} | {}"
+    print("-" * 80)
+    print(header_format.format("Test", "Statut", "Détails"))
+    print("-" * 80)
+    for res in results:
+        # Tronquer les détails si trop longs pour l'affichage console
+        details_display = res['details']
+        if len(details_display) > 40: # Ajuster la longueur max des détails
+            details_display = details_display[:37] + "..."
+        print(row_format.format(res['text'], res['status'], details_display))
+    print("-" * 80)
+    print("\n")
 
 # --- Fonctions de Scan ---
 def check_port(ip, port, open_ports_list, service_name):
@@ -290,21 +465,18 @@ def user_discovery_mode(target_ip, main_session):
                 if NXC_AVAILABLE:
                     # nxc ldap <target_ip> -u <users_file> -p '' (le -k est pour l'auth kerberos, pas pour le test d'existence)
                     # La sortie de nxc pour cette commande indique généralement les utilisateurs valides.
-                    output, _ = run_command(["nxc", "ldap", target_ip, "-u", users_file, "-p", "''"])
-                    if output:
-                        # NXC pour le test d'existence de compte affiche souvent les succès directement.
-                        # On peut essayer de parser les noms d'utilisateurs qui ont réussi.
-                        # Exemple de succès: LDAP 10.0.0.5 389 DC01 user1: (Valid account)
-                        # Ou simplement afficher la sortie et laisser l'utilisateur interpréter.
-                        # Pour l'instant, on va supposer que nxc liste les utilisateurs valides.
-                        # Un parsing plus fin serait nécessaire si le format est complexe.
-                        print("[!] La sortie de nxc est affichée ci-dessus. Veuillez identifier manuellement les comptes valides.")
-                        print("    L'ajout automatique à la liste des 'discovered_users' n'est pas implémenté pour cette méthode pour le moment.")
-                        # Si on voulait parser:
-                        # found_users = [] # Logique de parsing spécifique ici
-                        # if found_users:
-                        #     print(f"[+] Comptes existants trouvés: {', '.join(found_users)}")
-                        #     discovered_users_set.update(found_users)
+                    # On peut essayer de parser les noms d'utilisateurs qui ont réussi.
+                    # Exemple de succès: LDAP 10.0.0.5 389 DC01 user1: (Valid account)
+                    # Ou simplement afficher la sortie et laisser l'utilisateur interpréter.
+                    # Pour l'instant, on va supposer que nxc liste les utilisateurs valides.
+                    # Un parsing plus fin serait nécessaire si le format est complexe.
+                    print("[!] La sortie de nxc est affichée ci-dessus. Veuillez identifier manuellement les comptes valides.")
+                    print("    L'ajout automatique à la liste des 'discovered_users' n'est pas implémenté pour cette méthode pour le moment.")
+                    # Si on voulait parser:
+                    # found_users = [] # Logique de parsing spécifique ici
+                    # if found_users:
+                    #     print(f"[+] Comptes existants trouvés: {', '.join(found_users)}")
+                    #     discovered_users_set.update(found_users)
                 else:
                     print("[-] Commande 'nxc' non disponible.")
             
@@ -823,25 +995,17 @@ def display_help():
     print("  log                 - Afficher le chemin du fichier de log.")
     print("  exit                - Quitter l'application.")
 
-def main_cli(target_ip, open_services):
-    """Interface CLI interactive principale."""
-    logging.info(f"Lancement de l'interface CLI pour {target_ip}")
-    print("\n[*] Interface CLI interactive. Tapez 'help' pour la liste des commandes.")
-
-    session = PromptSession(
-        history=FileHistory('.ad_explorer_history'),
-        auto_suggest=AutoSuggestFromHistory(),
-        style=cli_style
-    )
-
-    # Préparer les commandes pour l'autocomplétion
-    base_commands = ["explore", "services", "set", "creds", "clear", "help", "log", "exit"]
-    explore_targets_dict = {s.lower(): None for s in SERVICE_PORTS.keys()}
-
-    completer = NestedCompleter.from_nested_dict({
-        "explore": explore_targets_dict,
-        "services": None,
-        "discoverusers": None, # Ajouté pour le nouveau mode
+def main_loop(target_ip, scanned_ports):
+    """Boucle principale pour interagir avec une cible."""
+    logging.info(f"Entrée dans la boucle principale pour {target_ip}. Ports scannés: {scanned_ports}")
+    # ... (completers existants)
+    target_commands = {
+        "help": "Afficher ce message d'aide.",
+        "prelim_scan": "Effectuer un scan préliminaire rapide (LDAP/SMB anonyme, ports AD).",
+        "smb": "Explorer les services SMB.",
+        "ldap": "Explorer les services LDAP/LDAPS.",
+        "discoverusers": "Entrer en Mode Découverte d'Utilisateurs (SMB Null, LDAP Anon, Kerbrute).",
+        "services": "Afficher à nouveau les services détectés.",
         "set": {
             "user": None,
             "password": None,
@@ -849,11 +1013,9 @@ def main_cli(target_ip, open_services):
         },
         "creds": None,
         "clear": {"creds": None},
-        "help": None,
-        "log": None,
         "exit": None,
-    })
-    
+    }
+
     while True:
         try:
             prompt_text = f"ad_explorer ({target_ip})> "
@@ -871,63 +1033,30 @@ def main_cli(target_ip, open_services):
                 print("Au revoir !")
                 break
             elif cmd == "help":
-                display_help()
-            elif cmd == "log":
-                print(f"[*] Les logs sont enregistrés dans : {LOG_FILE}")
+                print_target_menu(target_commands)
+            elif cmd == "prelim_scan":
+                run_preliminary_scan(target_ip, scanned_ports, session) # Passer scanned_ports
+            elif cmd == "smb":
+                smb_ports = scanned_ports.get("SMB", {}).get("ports", [])
+                if not smb_ports:
+                    print("Usage: smb <service_name>")
+                    continue
+                explore_smb(target_ip, smb_ports, session)
+            elif cmd == "ldap":
+                ldap_ports = scanned_ports.get("LDAP", {}).get("ports", [])
+                if not ldap_ports:
+                    print("Usage: ldap <service_name>")
+                    continue
+                explore_ldap(target_ip, ldap_ports, session)
+            elif cmd == "discoverusers":
+                user_discovery_mode(target_ip, session)
             elif cmd == "services":
                 print("\n[+] Services potentiels détectés :")
-                if open_services:
-                    for service, ports in open_services.items():
+                if scanned_ports:
+                    for service, ports in scanned_ports.items():
                         print(f"  - {service} (Ports: {', '.join(map(str, ports))})")
                 else:
                     print("  Aucun service n'a été détecté lors du scan initial.")
-            elif cmd == "explore":
-                if len(command_parts) > 1:
-                    service_to_explore = command_parts[1].upper()
-                    # Mapper les noms de service saisis par l'utilisateur aux clés de SERVICE_PORTS
-                    # ou aux clés de open_services
-                    
-                    # Chercher une correspondance exacte ou partielle pour le nom du service
-                    matched_service_key = None
-                    for key_serv in open_services.keys():
-                        if service_to_explore == key_serv.upper():
-                            matched_service_key = key_serv
-                            break
-                        # Gérer les cas comme winrm_http -> WinRM_HTTP
-                        if service_to_explore.replace("_","") == key_serv.upper().replace("_",""):
-                             matched_service_key = key_serv
-                             break
-                    
-                    if matched_service_key and matched_service_key in open_services:
-                        ports = open_services[matched_service_key]
-                        if matched_service_key == "SMB":
-                            explore_smb(target_ip, ports, session)
-                        elif matched_service_key == "LDAP" or matched_service_key == "GlobalCatalog_LDAP":
-                            explore_ldap(target_ip, ports, session)
-                        elif matched_service_key == "LDAPS" or matched_service_key == "GlobalCatalog_LDAPS":
-                            print(f"[*] LDAPS/GlobalCatalog_LDAPS utilise le port {ports}. La connexion sera sécurisée (ldaps://).")
-                            explore_ldap(target_ip, ports, session) # La fonction explore_ldap gère ldaps
-                        elif matched_service_key == "MSSQL":
-                            explore_mssql(target_ip, ports)
-                        elif matched_service_key == "RDP":
-                            explore_rdp(target_ip, ports)
-                        elif matched_service_key == "WinRM_HTTP" or matched_service_key == "WinRM_HTTPS":
-                            explore_winrm(target_ip, ports)
-                        elif matched_service_key == "RPC_Mapper":
-                            explore_rpc(target_ip, ports, session)
-                        elif matched_service_key == "DNS":
-                            explore_dns(target_ip, ports)
-                        elif matched_service_key == "Kerberos":
-                            explore_kerberos(target_ip, ports)
-                        else:
-                            print(f"L'exploration pour le service '{matched_service_key}' n'est pas encore implémentée ou reconnue.")
-                    else:
-                        print(f"Service '{command_parts[1]}' non détecté ou non supporté pour l'exploration.")
-                    print(f"Services détectés disponibles : {', '.join(open_services.keys())}")
-                else:
-                    print("Usage: explore <service_name>")
-                    print(f"Services détectés disponibles : {', '.join(open_services.keys())}")
-
             elif cmd == "set":
                 if len(command_parts) > 2:
                     cred_type = command_parts[1]
@@ -962,9 +1091,6 @@ def main_cli(target_ip, open_services):
                 print("[*] Identifiants effacés.")
                 logging.info("Identifiants effacés.")
             
-            elif cmd == "discoverusers": # Nouvelle commande
-                user_discovery_mode(target_ip, session)
-            
             else:
                 print(f"Commande inconnue: {cmd}. Tapez 'help' pour la liste des commandes.")
 
@@ -994,12 +1120,16 @@ Dépendances externes requises (doivent être dans le PATH):
 """
     )
     parser.add_argument("target_ip", help="Adresse IP de la cible (ex: contrôleur de domaine).")
+    parser.add_argument("--no-color", action="store_true", help="Désactiver la sortie colorée pour les messages non-prompt_toolkit.")
     
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
         sys.exit(1)
         
     args = parser.parse_args()
+
+    if args.no_color:
+        AnsiColors.NO_COLOR_MODE = True
 
     try:
         ipaddress.ip_address(args.target_ip) # Valide l'adresse IP
@@ -1010,9 +1140,10 @@ Dépendances externes requises (doivent être dans le PATH):
 
     logging.info(f"AD Explorer démarré. Cible: {args.target_ip}")
 
-    NXC_AVAILABLE = check_command_exists("nxc")
+    NXC_AVAILABLE = check_command_exists("nxc") or check_command_exists("netexec")
     RPCCLIENT_AVAILABLE = check_command_exists("rpcclient")
-    KERBRUTE_AVAILABLE = check_command_exists("kerbrute") # Vérification de Kerbrute
+    KERBRUTE_AVAILABLE = check_command_exists("kerbrute")
+    IMPACKET_EXAMPLES_AVAILABLE = check_command_exists("samrdump.py") # Juste un exemple
     
     if not NXC_AVAILABLE or not RPCCLIENT_AVAILABLE:
         print("[!] Certaines fonctionnalités seront limitées car des outils externes sont manquants.")
@@ -1025,6 +1156,6 @@ Dépendances externes requises (doivent être dans le PATH):
         # print("[-] Aucun service pertinent détecté. L'outil va quand même démarrer en mode limité.")
         # Pour l'instant, on continue pour permettre l'utilisation de 'set creds' etc.
 
-    main_cli(args.target_ip, open_services_found)
+    main_loop(args.target_ip, open_services_found)
 
     logging.info("AD Explorer terminé.") 

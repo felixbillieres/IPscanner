@@ -16,6 +16,21 @@ DEFAULT_EXTENSIONS_FILE = "extensions.txt"
 DEFAULT_USER_AGENTS_FILE = "user_agents.txt"
 REQUEST_TIMEOUT = 10 # secondes
 
+# --- Couleurs ANSI ---
+class Colors:
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    LIGHT_RED = '\033[1;31m' # Pour 403 par exemple
+    GRAY = '\033[90m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    ENDC = '\033[0m'
+
 # Listes pour stocker les résultats et les informations
 found_results = []
 total_requests_made = 0
@@ -195,8 +210,26 @@ def make_request(session, url_to_check, stealth_mode, stealth_delay, original_wo
         status_code = response.status_code
         content_length = response.headers.get('Content-Length', 'N/A')
 
+        color = Colors.WHITE
+        if 200 <= status_code < 300:
+            color = Colors.GREEN
+        elif 300 <= status_code < 400:
+            color = Colors.YELLOW
+        elif status_code == 403:
+            color = Colors.LIGHT_RED
+        elif status_code == 401:
+            color = Colors.MAGENTA
+        elif status_code == 404:
+            color = Colors.GRAY
+        elif status_code >= 500:
+            color = Colors.RED
+
         with print_lock:
-            print(f"[{status_code}] {url_to_check} (Taille: {content_length})")
+            # Formatter la sortie avec la couleur
+            status_str = f"[{color}{status_code}{Colors.ENDC}]"
+            url_str = f"{Colors.WHITE}{url_to_check}{Colors.ENDC}"
+            size_str = f"(Taille: {Colors.CYAN}{content_length}{Colors.ENDC})"
+            print(f"{status_str} {url_str} {size_str}")
 
         if status_code == 200:
             with lock:
@@ -261,8 +294,15 @@ def main():
     parser.add_argument("-s", "--stealth", action="store_true", help="Activer le mode furtif (délais, user-agents aléatoires, respect de robots.txt)")
     parser.add_argument("--stealth-delay", type=float, default=1.0, help="Délai moyen en secondes entre les requêtes en mode furtif (défaut: 1.0s)")
     parser.add_argument("--user-agents", default=DEFAULT_USER_AGENTS_FILE, help=f"Fichier des agents utilisateurs (défaut: {DEFAULT_USER_AGENTS_FILE})")
+    parser.add_argument("--no-color", action="store_true", help="Désactiver la sortie colorée.")
 
     args = parser.parse_args()
+
+    # Désactiver les couleurs si demandé
+    if args.no_color:
+        for attr in dir(Colors):
+            if not callable(getattr(Colors, attr)) and not attr.startswith("__"):
+                setattr(Colors, attr, "")
 
     # Normaliser l'URL cible
     if not args.target_url.startswith(('http://', 'https://')):
@@ -272,14 +312,14 @@ def main():
     target_domain = parsed_target_url.netloc
 
     print("--- Configuration du Scan ---")
-    print(f"[*] Cible: {args.target_url}")
-    print(f"[*] Mode: {'Furtif' if args.stealth else 'Agressif'}")
-    print(f"[*] Threads: {args.threads}")
-    print(f"[*] Wordlist: {args.wordlist}")
-    print(f"[*] Fichier d'extensions: {args.extensions}")
+    print(f"[*] Cible: {Colors.CYAN}{args.target_url}{Colors.ENDC}")
+    print(f"[*] Mode: {Colors.YELLOW}{'Furtif' if args.stealth else 'Agressif'}{Colors.ENDC}")
+    print(f"[*] Threads: {Colors.YELLOW}{args.threads}{Colors.ENDC}")
+    print(f"[*] Wordlist: {Colors.YELLOW}{args.wordlist}{Colors.ENDC}")
+    print(f"[*] Fichier d'extensions: {Colors.YELLOW}{args.extensions}{Colors.ENDC}")
     if args.stealth:
-        print(f"[*] Délai furtif moyen: {args.stealth_delay}s")
-        print(f"[*] Fichier User-Agents: {args.user_agents}")
+        print(f"[*] Délai furtif moyen: {Colors.YELLOW}{args.stealth_delay}s{Colors.ENDC}")
+        print(f"[*] Fichier User-Agents: {Colors.YELLOW}{args.user_agents}{Colors.ENDC}")
     print("-----------------------------\n")
 
     load_user_agents(args.user_agents)
@@ -309,15 +349,15 @@ def main():
     # Détection du serveur et adaptation des extensions
     print("[*] Détection du serveur et adaptation des extensions...")
     server_info = detect_server_and_cms(args.target_url)
-    print(f"[*] Serveur détecté: {server_info['type']} ({server_info['details']})")
+    print(f"[*] Serveur détecté: {Colors.GREEN}{server_info['type']}{Colors.ENDC} ({server_info['details']})")
     if server_info['cms']:
-        print(f"[*] CMS détectés: {', '.join(server_info['cms'])}")
+        print(f"[*] CMS détectés: {Colors.GREEN}{', '.join(server_info['cms'])}{Colors.ENDC}")
     
     final_extensions = adapt_extensions(base_extensions, server_info)
     if len(final_extensions) != len(base_extensions):
-        print(f"[*] Extensions adaptées pour le serveur/CMS. Nombre total d'extensions à tester: {len(final_extensions)}")
+        print(f"[*] Extensions adaptées pour le serveur/CMS. Nombre total d'extensions à tester: {Colors.YELLOW}{len(final_extensions)}{Colors.ENDC}")
     else:
-        print(f"[*] Utilisation de la liste d'extensions de base. Nombre total d'extensions à tester: {len(final_extensions)}")
+        print(f"[*] Utilisation de la liste d'extensions de base. Nombre total d'extensions à tester: {Colors.YELLOW}{len(final_extensions)}{Colors.ENDC}")
     # print(f"[*] Extensions finales: {final_extensions[:10]}...") # Debug
 
     # Gestion de robots.txt pour le mode furtif
@@ -367,18 +407,18 @@ def main():
     scan_duration = end_time - start_time
 
     print("\n--- Scan Terminé ---")
-    print(f"[*] Temps total du scan: {scan_duration:.2f} secondes")
-    print(f"[*] URL Cible: {args.target_url}")
-    print(f"[*] Mode de scan: {'Furtif' if args.stealth else 'Agressif'}")
-    print(f"[*] Requêtes totales effectuées: {total_requests_made}")
+    print(f"[*] Temps total du scan: {Colors.YELLOW}{scan_duration:.2f} secondes{Colors.ENDC}")
+    print(f"[*] URL Cible: {Colors.CYAN}{args.target_url}{Colors.ENDC}")
+    print(f"[*] Mode de scan: {Colors.YELLOW}{'Furtif' if args.stealth else 'Agressif'}{Colors.ENDC}")
+    print(f"[*] Requêtes totales effectuées: {Colors.YELLOW}{total_requests_made}{Colors.ENDC}")
     
     results_200 = [r for r in found_results if r['status'] == 200]
-    print(f"[*] Nombre de résultats 200 OK: {len(results_200)}")
+    print(f"[*] Nombre de résultats 200 OK: {Colors.GREEN}{len(results_200)}{Colors.ENDC}")
 
     if results_200:
         output_files, results_dir_path = save_results(results_200, target_domain)
         if output_files:
-            print(f"[*] Résultats sauvegardés dans le répertoire: {results_dir_path}")
+            print(f"[*] Résultats sauvegardés dans le répertoire: {Colors.GREEN}{results_dir_path}{Colors.ENDC}")
             for f_name in output_files:
                 print(f"    - {os.path.basename(f_name)}")
         else:
@@ -387,11 +427,11 @@ def main():
         print("[*] Aucun résultat avec le statut 200 OK trouvé.")
 
     print("\n--- Informations Serveur et Extensions ---")
-    print(f"[*] Type de serveur détecté: {server_info['type']}")
+    print(f"[*] Type de serveur détecté: {Colors.GREEN}{server_info['type']}{Colors.ENDC}")
     if server_info['details']:
         print(f"    - En-tête Server: {server_info['details']}")
     if server_info['cms']:
-        print(f"[*] CMS potentiels détectés: {', '.join(server_info['cms'])}")
+        print(f"[*] CMS potentiels détectés: {Colors.GREEN}{', '.join(server_info['cms'])}{Colors.ENDC}")
     
     if len(final_extensions) != len(base_extensions):
         print("[*] Les extensions ont été adaptées en fonction des informations du serveur.")

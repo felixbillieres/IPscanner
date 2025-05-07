@@ -10,21 +10,39 @@ import shutil
 import sys
 import re
 
+# --- Couleurs ANSI ---
+class Colors:
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+    GRAY = '\033[90m'
+    BOLD = '\033[1m'
+    ENDC = '\033[0m'
+    NO_COLOR_MODE = False # Variable globale pour gérer le mode sans couleur
+
 HOSTS_FILE_PATH = "/etc/hosts"
 HOSTS_ENTRY_TAG = "# Ajouté par DomainDiscoverPy"
 
 # --- Fonctions utilitaires ---
 def print_info(message):
-    print(f"[*] {message}")
+    if Colors.NO_COLOR_MODE: print(f"[*] {message}")
+    else: print(f"{Colors.CYAN}[*] {message}{Colors.ENDC}")
 
 def print_success(message):
-    print(f"[+] {message}")
+    if Colors.NO_COLOR_MODE: print(f"[+] {message}")
+    else: print(f"{Colors.GREEN}[+] {message}{Colors.ENDC}")
 
 def print_warning(message):
-    print(f"[!] {message}")
+    if Colors.NO_COLOR_MODE: print(f"[!] {message}")
+    else: print(f"{Colors.YELLOW}[!] {message}{Colors.ENDC}")
 
 def print_error(message):
-    print(f"[-] {message}")
+    if Colors.NO_COLOR_MODE: print(f"[-] {message}")
+    else: print(f"{Colors.RED}[-] {message}{Colors.ENDC}")
 
 def check_tool_installed(tool_name):
     """Vérifie si un outil est installé et accessible dans le PATH."""
@@ -179,7 +197,7 @@ def modify_hosts_file(ip_address, domain_name, add_entry=True):
 
 def run_subfinder(domain_name):
     """Exécute subfinder pour découvrir les sous-domaines."""
-    print_info(f"Lancement de Subfinder pour {domain_name}...")
+    print_info(f"Lancement de Subfinder pour {Colors.YELLOW}{domain_name}{Colors.ENDC}...")
     try:
         process = subprocess.run(
             ["subfinder", "-d", domain_name, "-silent"],
@@ -192,7 +210,7 @@ def run_subfinder(domain_name):
         if subdomains:
             print_success(f"{len(subdomains)} sous-domaines trouvés par Subfinder.")
             # for sd in subdomains:
-            #     print(f"  - {sd}")
+            #     print(f"  - {Colors.GREEN}{sd}{Colors.ENDC}") # Optionnel de colorer ici, le rapport final le fera
             return subdomains
         else:
             print_warning("Aucun sous-domaine trouvé par Subfinder.")
@@ -238,15 +256,11 @@ def run_httpx(subdomains):
         print_info(f"Exécution de la commande: {' '.join(command)}")
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
         
-        print_success("Résultats de Httpx (URL [Code Statut, Titre, Serveur, Technologies]):")
+        print_success("Résultats de Httpx:")
         
         # Regex pour parser la sortie de httpx (simplifié, peut nécessiter ajustement)
         # Exemple de sortie: http://test.example.com [200, "Example Domain", "ECS (sjc/4E5D)", "AmazonS3,Route53"]
-        # httpx -silent -no-color -status-code -title -web-server -tech-detect
-        # http://sub.domain.com [200,Title of the page,nginx,PHP]
-        # https://sub.domain.com [200,Title of the page,Apache,WordPress,jQuery]
-        # L'option -server est alias de -web-server
-        regex = re.compile(r"^(https?://[^ ]+) \[(\d{3}),(.+?),(.+?),(.*?)\]$")
+        regex = re.compile(r"^(https?://[^ ]+)\s*\[(\d{3}),(.*?),(.+?),(.*?)\]$")
 
 
         for line in iter(process.stdout.readline, ''):
@@ -254,8 +268,29 @@ def run_httpx(subdomains):
             if not line:
                 continue
             
-            print(f"  {line}") # Afficher la ligne brute de httpx
-            httpx_results.append(line) # Stocker la ligne brute pour le rapport
+            # Appliquer la couleur basée sur le code de statut
+            match = regex.match(line)
+            if match:
+                url, status_code_str, title, server, tech = match.groups()
+                status_code = int(status_code_str)
+                
+                status_color = Colors.WHITE
+                if 200 <= status_code < 300: status_color = Colors.GREEN
+                elif 300 <= status_code < 400: status_color = Colors.YELLOW
+                elif status_code == 403: status_color = Colors.RED
+                elif status_code == 404: status_color = Colors.GRAY
+                elif status_code >= 500: status_color = Colors.RED
+
+                if Colors.NO_COLOR_MODE:
+                    print(f"  {line}")
+                else:
+                    colored_status = f"{status_color}{status_code}{Colors.ENDC}"
+                    print(f"  {Colors.WHITE}{url}{Colors.ENDC} [{colored_status},{Colors.CYAN}{title}{Colors.ENDC},{Colors.MAGENTA}{server}{Colors.ENDC},{Colors.BLUE}{tech}{Colors.ENDC}]")
+            else:
+                if Colors.NO_COLOR_MODE: print(f"  {line}")
+                else: print(f"  {Colors.GRAY}{line}{Colors.ENDC}") # Ligne non parsée, afficher en gris
+            
+            httpx_results.append(line) # Stocker la ligne brute pour le rapport (ou la ligne colorée si on préfère)
 
         process.wait()
         
@@ -285,10 +320,14 @@ def run_httpx(subdomains):
 def main():
     parser = argparse.ArgumentParser(description="Découverte de sous-domaines à partir d'une adresse IP.")
     parser.add_argument("ip_address", help="L'adresse IP cible.")
+    parser.add_argument("--no-color", action="store_true", help="Désactiver la sortie colorée.")
     args = parser.parse_args()
 
+    if args.no_color:
+        Colors.NO_COLOR_MODE = True
+
     ip_address = args.ip_address
-    print_info(f"Adresse IP cible: {ip_address}")
+    print_info(f"Adresse IP cible: {Colors.YELLOW}{ip_address}{Colors.ENDC}")
 
     # Vérifier les outils requis
     if not check_tool_installed("subfinder") or not check_tool_installed("httpx"):
@@ -299,7 +338,7 @@ def main():
         print_error("Impossible de continuer sans nom de domaine.")
         sys.exit(1)
     
-    print_success(f"Nom de domaine principal sélectionné: {domain_name}")
+    print_success(f"Nom de domaine principal sélectionné: {Colors.GREEN}{domain_name}{Colors.ENDC}")
 
     hosts_modified = False
     if modify_hosts_file(ip_address, domain_name, add_entry=True):
@@ -315,8 +354,8 @@ def main():
 
     # Rapport final
     print("\n--- Rapport Final ---")
-    print(f"Adresse IP Cible: {ip_address}")
-    print(f"Nom de Domaine Principal: {domain_name}")
+    print(f"Adresse IP Cible: {Colors.YELLOW}{ip_address}{Colors.ENDC}")
+    print(f"Nom de Domaine Principal: {Colors.GREEN}{domain_name}{Colors.ENDC}")
     
     if hosts_modified:
         print_info(f"Le fichier {HOSTS_FILE_PATH} a été configuré pour {ip_address} -> {domain_name}.")
@@ -329,14 +368,35 @@ def main():
     if subdomains_found:
         print_success(f"Sous-domaines découverts par Subfinder ({len(subdomains_found)}):")
         for sd in subdomains_found:
-            print(f"  - {sd}")
+            if Colors.NO_COLOR_MODE: print(f"  - {sd}")
+            else: print(f"  - {Colors.GREEN}{sd}{Colors.ENDC}")
     else:
         print_warning("Aucun sous-domaine n'a été découvert.")
 
-    if httpx_output:
-        print_success("Informations Httpx:")
-        for res in httpx_output:
-            print(f"  {res}")
+    if httpx_output: # httpx_output contient les lignes brutes
+        print_success("Informations Httpx (re-traitées pour couleur):")
+        regex_report = re.compile(r"^(https?://[^ ]+)\s*\[(\d{3}),(.*?),(.+?),(.*?)\]$")
+        for res_line in httpx_output:
+            match = regex_report.match(res_line)
+            if match:
+                url, status_code_str, title, server, tech = match.groups()
+                status_code = int(status_code_str)
+                
+                status_color = Colors.WHITE
+                if 200 <= status_code < 300: status_color = Colors.GREEN
+                elif 300 <= status_code < 400: status_color = Colors.YELLOW
+                elif status_code == 403: status_color = Colors.RED
+                elif status_code == 404: status_color = Colors.GRAY
+                elif status_code >= 500: status_color = Colors.RED
+
+                if Colors.NO_COLOR_MODE:
+                    print(f"  {res_line}")
+                else:
+                    colored_status = f"{status_color}{status_code}{Colors.ENDC}"
+                    print(f"  {Colors.WHITE}{url}{Colors.ENDC} [{colored_status},{Colors.CYAN}{title}{Colors.ENDC},{Colors.MAGENTA}{server}{Colors.ENDC},{Colors.BLUE}{tech}{Colors.ENDC}]")
+            else:
+                if Colors.NO_COLOR_MODE: print(f"  {res_line}")
+                else: print(f"  {Colors.GRAY}{res_line}{Colors.ENDC}")
     elif subdomains_found:
         print_warning("Aucune information n'a été collectée par Httpx pour les sous-domaines trouvés.")
 
