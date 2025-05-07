@@ -1,0 +1,403 @@
+import requests
+import argparse
+import threading
+import time
+import random
+import os
+import datetime
+from queue import Queue
+from urllib.parse import urlparse, urljoin
+from urllib.robotparser import RobotFileParser
+
+# --- Configuration Globale ---
+DEFAULT_THREADS = 10
+DEFAULT_WORDLIST = "wordlist.txt"
+DEFAULT_EXTENSIONS_FILE = "extensions.txt"
+DEFAULT_USER_AGENTS_FILE = "user_agents.txt"
+REQUEST_TIMEOUT = 10 # secondes
+
+# Listes pour stocker les résultats et les informations
+found_results = []
+total_requests_made = 0
+lock = threading.Lock()
+print_lock = threading.Lock()
+
+# --- Agents Utilisateurs ---
+USER_AGENTS = []
+
+def load_user_agents(filename=DEFAULT_USER_AGENTS_FILE):
+    """Charge les agents utilisateurs depuis un fichier."""
+    global USER_AGENTS
+    try:
+        with open(filename, 'r') as f:
+            USER_AGENTS = [line.strip() for line in f if line.strip()]
+        if not USER_AGENTS:
+            print(f"[!] Attention: Le fichier d'agents utilisateurs '{filename}' est vide. Utilisation d'un agent par défaut.")
+            USER_AGENTS = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/97.0.4692.71 Safari/537.36"]
+    except FileNotFoundError:
+        print(f"[!] Erreur: Fichier d'agents utilisateurs '{filename}' non trouvé. Utilisation d'un agent par défaut.")
+        USER_AGENTS = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/97.0.4692.71 Safari/537.36"]
+
+def get_random_user_agent():
+    """Retourne un agent utilisateur aléatoire."""
+    return random.choice(USER_AGENTS) if USER_AGENTS else "Python Content Scanner"
+
+# --- Détection du Serveur et Adaptation des Extensions ---
+def detect_server_and_cms(target_url):
+    """
+    Effectue une requête HEAD pour détecter le type de serveur et potentiellement des CMS.
+    Retourne un dictionnaire avec les informations du serveur et les CMS détectés.
+    """
+    server_info = {"type": "Unknown", "details": "", "cms": []}
+    headers = {'User-Agent': get_random_user_agent()}
+    try:
+        response = requests.head(target_url, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        if 'Server' in response.headers:
+            server_header = response.headers['Server']
+            server_info["details"] = server_header
+            if "iis" in server_header.lower():
+                server_info["type"] = "IIS"
+            elif "apache" in server_header.lower():
+                server_info["type"] = "Apache"
+            elif "nginx" in server_header.lower():
+                server_info["type"] = "Nginx"
+            # Ajout de détections basiques de CMS via les en-têtes (peut être étendu)
+            if "X-Powered-By" in response.headers:
+                if "ASP.NET" in response.headers["X-Powered-By"]:
+                     if server_info["type"] == "Unknown": server_info["type"] = "IIS" # Souvent lié
+                if "PHP" in response.headers["X-Powered-By"]:
+                     if server_info["type"] == "Unknown": server_info["type"] = "Apache/Nginx" # Souvent lié
+            if "X-Drupal-Cache" in response.headers or "X-Generator" in response.headers and "Drupal" in response.headers["X-Generator"]:
+                server_info["cms"].append("Drupal")
+            if response.headers.get("Link") and "wp.me" in response.headers.get("Link", ""): # WordPress.com hosted
+                 server_info["cms"].append("WordPress")
+            # On pourrait aussi faire une requête GET sur la page d'accueil et chercher des motifs
+            # comme <meta name="generator" content="WordPress X.Y.Z" />
+            # ou des chemins spécifiques comme /wp-includes/js/wp-emoji-release.min.js
+
+    except requests.RequestException as e:
+        with print_lock:
+            print(f"[!] Erreur lors de la détection du serveur sur {target_url}: {e}")
+    return server_info
+
+def adapt_extensions(base_extensions, server_info):
+    """Adapte la liste d'extensions en fonction du serveur et des CMS détectés."""
+    adapted_extensions = list(base_extensions) # Copie pour ne pas modifier l'original
+    specific_extensions = []
+
+    if server_info["type"] == "IIS":
+        specific_extensions.extend(['.aspx', '.asp', '.asmx', '.config', '.dll', '.ashx', '.svc'])
+    elif server_info["type"] in ["Apache", "Nginx"]:
+        specific_extensions.extend(['.php', '.php3', '.php4', '.php5', '.phtml', '.py', '.rb', '.pl', '.cgi', '.htaccess'])
+
+    if "WordPress" in server_info["cms"]:
+        specific_extensions.extend([
+            'wp-config.php', 'wp-config.php.bak', 'wp-config.php.old', 'wp-config.php.txt',
+            '.env', 'debug.log', 'xmlrpc.php'
+        ])
+        # Ajouter des chemins spécifiques à WordPress à la wordlist serait aussi une bonne idée
+    if "Joomla" in server_info["cms"]: # Exemple, détection non implémentée
+        specific_extensions.extend(['configuration.php', 'configuration.php.bak'])
+    if "Drupal" in server_info["cms"]:
+        specific_extensions.extend(['sites/default/settings.php'])
+
+
+    # Ajoute les extensions spécifiques au début pour les tester en priorité,
+    # tout en évitant les doublons et en conservant les extensions de base.
+    final_extensions = [ext for ext in specific_extensions if ext not in adapted_extensions] + adapted_extensions
+    
+    # S'assurer que les extensions commencent par un point si ce n'est pas un nom de fichier complet
+    final_extensions = [ext if ext.startswith('.') or '/' in ext else '.' + ext for ext in final_extensions]
+    # Pour les noms de fichiers complets (comme wp-config.php), on ne veut pas de point devant
+    final_extensions = [ext[1:] if ext.startswith('.') and not ext[1:].startswith('.') and ext.count('.') == 1 and not any(c.islower() for c in ext[1:]) else ext for ext in final_extensions]
+    # Correction pour les noms de fichiers complets qui pourraient avoir un point en trop
+    final_extensions = [ext.replace('..', '.') for ext in final_extensions]
+    final_extensions = list(dict.fromkeys(final_extensions)) # Enlever les doublons en conservant l'ordre
+
+    return final_extensions
+
+# --- Gestion de robots.txt ---
+class RobotsManager:
+    def __init__(self, target_url):
+        self.rp = RobotFileParser()
+        self.target_base_url = urljoin(target_url, '/')
+        robots_url = urljoin(self.target_base_url, "robots.txt")
+        self.rp.set_url(robots_url)
+        try:
+            self.rp.read()
+        except Exception as e:
+            with print_lock:
+                print(f"[!] Avertissement: Impossible de lire ou parser robots.txt depuis {robots_url}: {e}")
+
+    def can_fetch(self, user_agent, path):
+        """Vérifie si le chemin est autorisé par robots.txt."""
+        full_url = urljoin(self.target_base_url, path)
+        return self.rp.can_fetch(user_agent, full_url)
+
+# --- Logique de Scan ---
+def scan_worker(target_url, path_queue, extensions, stealth_mode, stealth_delay, robots_manager, user_agent_for_robots):
+    """Travailleur qui prend des chemins de la file et les scanne."""
+    global total_requests_made, found_results
+
+    s = requests.Session() # Utiliser une session pour la persistance des connexions (si applicable)
+
+    while not path_queue.empty():
+        try:
+            word = path_queue.get_nowait()
+        except Exception: # queue.Empty n'est pas toujours levé comme attendu avec get_nowait dans certains contextes
+            return
+
+        # Construire le chemin de base (sans extension)
+        base_path_to_check = f"{target_url.rstrip('/')}/{word}"
+
+        # 1. Vérifier le chemin/répertoire sans extension
+        if not stealth_mode or (robots_manager and robots_manager.can_fetch(user_agent_for_robots, word)):
+            make_request(s, base_path_to_check, stealth_mode, stealth_delay, word, "")
+        
+        # 2. Vérifier avec les extensions
+        for ext in extensions:
+            # Si l'extension est un nom de fichier complet (ex: wp-config.php),
+            # elle doit être testée à la racine du mot (qui pourrait être un répertoire)
+            if not ext.startswith('.'): 
+                path_to_check = f"{target_url.rstrip('/')}/{word}/{ext.lstrip('/')}"
+            else: # Extension classique
+                path_to_check = f"{target_url.rstrip('/')}/{word}{ext}"
+            
+            # Construire le chemin relatif pour robots.txt
+            relative_path_for_robots = f"{word}{ext}" if ext.startswith('.') else f"{word}/{ext.lstrip('/')}"
+
+            if not stealth_mode or (robots_manager and robots_manager.can_fetch(user_agent_for_robots, relative_path_for_robots)):
+                make_request(s, path_to_check, stealth_mode, stealth_delay, word, ext)
+            else:
+                with print_lock:
+                    print(f"[*] Ignoré par robots.txt: {path_to_check}")
+        
+        path_queue.task_done()
+
+def make_request(session, url_to_check, stealth_mode, stealth_delay, original_word, original_ext):
+    """Effectue une requête HTTP et gère la réponse."""
+    global total_requests_made, found_results
+    
+    headers = {'User-Agent': get_random_user_agent()}
+    
+    if stealth_mode and stealth_delay > 0:
+        time.sleep(random.uniform(stealth_delay * 0.5, stealth_delay * 1.5))
+
+    try:
+        with lock:
+            total_requests_made += 1
+        
+        response = session.get(url_to_check, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True, stream=True) # stream=True pour ne pas dl de gros fichiers
+        
+        # On ferme la connexion pour libérer les ressources, surtout avec stream=True
+        response.close()
+
+        status_code = response.status_code
+        content_length = response.headers.get('Content-Length', 'N/A')
+
+        with print_lock:
+            print(f"[{status_code}] {url_to_check} (Taille: {content_length})")
+
+        if status_code == 200:
+            with lock:
+                found_results.append({'url': url_to_check, 'status': status_code, 'ext': original_ext if original_ext.startswith('.') else os.path.splitext(original_ext)[1]})
+        # On pourrait aussi logger d'autres codes intéressants (403, 401, 30x si on ne suit pas les redirections, etc.)
+
+    except requests.exceptions.RequestException as e:
+        # Gérer les erreurs de manière silencieuse ou avec un log discret
+        # with print_lock:
+        #     print(f"[!] Erreur pour {url_to_check}: {type(e).__name__}")
+        pass
+
+
+# --- Gestion des Résultats ---
+def save_results(results, target_domain):
+    """Sauvegarde les résultats trouvés dans des fichiers par extension."""
+    if not results:
+        return []
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_dir = f"results_{target_domain}_{timestamp}"
+    os.makedirs(results_dir, exist_ok=True)
+
+    organized_results = {}
+    for res in results:
+        if res['status'] == 200:
+            ext = res['ext'].replace('.', '') if res['ext'] and res['ext'].startswith('.') else 'no_ext'
+            if not ext: # Pour les cas comme /admin (pas d'extension mais trouvé)
+                # On essaie de deviner à partir de l'URL si c'est un fichier connu
+                parsed_url_path = urlparse(res['url']).path
+                _root, file_ext = os.path.splitext(parsed_url_path)
+                if file_ext:
+                    ext = file_ext.replace('.', '')
+                else: # C'est probablement un répertoire ou un fichier sans extension visible
+                    ext = "directory_or_no_ext"
+
+
+            if ext not in organized_results:
+                organized_results[ext] = []
+            organized_results[ext].append(res['url'])
+
+    output_files = []
+    for ext, urls in organized_results.items():
+        if urls:
+            filename = os.path.join(results_dir, f"{ext}_found.txt")
+            with open(filename, 'w') as f:
+                for url in urls:
+                    f.write(url + "\n")
+            output_files.append(filename)
+    
+    return output_files, results_dir
+
+# --- Fonction Principale ---
+def main():
+    global total_requests_made, found_results
+
+    parser = argparse.ArgumentParser(description="Outil de découverte de contenu web intelligent et furtif.")
+    parser.add_argument("target_url", help="URL cible (ex: http://example.com)")
+    parser.add_argument("-w", "--wordlist", default=DEFAULT_WORDLIST, help=f"Chemin vers la wordlist (défaut: {DEFAULT_WORDLIST})")
+    parser.add_argument("-x", "--extensions", default=DEFAULT_EXTENSIONS_FILE, help=f"Chemin vers le fichier d'extensions (défaut: {DEFAULT_EXTENSIONS_FILE})")
+    parser.add_argument("-t", "--threads", type=int, default=DEFAULT_THREADS, help=f"Nombre de threads (défaut: {DEFAULT_THREADS})")
+    parser.add_argument("-s", "--stealth", action="store_true", help="Activer le mode furtif (délais, user-agents aléatoires, respect de robots.txt)")
+    parser.add_argument("--stealth-delay", type=float, default=1.0, help="Délai moyen en secondes entre les requêtes en mode furtif (défaut: 1.0s)")
+    parser.add_argument("--user-agents", default=DEFAULT_USER_AGENTS_FILE, help=f"Fichier des agents utilisateurs (défaut: {DEFAULT_USER_AGENTS_FILE})")
+
+    args = parser.parse_args()
+
+    # Normaliser l'URL cible
+    if not args.target_url.startswith(('http://', 'https://')):
+        args.target_url = 'http://' + args.target_url
+    
+    parsed_target_url = urlparse(args.target_url)
+    target_domain = parsed_target_url.netloc
+
+    print("--- Configuration du Scan ---")
+    print(f"[*] Cible: {args.target_url}")
+    print(f"[*] Mode: {'Furtif' if args.stealth else 'Agressif'}")
+    print(f"[*] Threads: {args.threads}")
+    print(f"[*] Wordlist: {args.wordlist}")
+    print(f"[*] Fichier d'extensions: {args.extensions}")
+    if args.stealth:
+        print(f"[*] Délai furtif moyen: {args.stealth_delay}s")
+        print(f"[*] Fichier User-Agents: {args.user_agents}")
+    print("-----------------------------\n")
+
+    load_user_agents(args.user_agents)
+
+    # Charger la wordlist
+    try:
+        with open(args.wordlist, 'r', encoding='utf-8', errors='ignore') as f:
+            words = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+    except FileNotFoundError:
+        print(f"[!] Erreur: Wordlist '{args.wordlist}' non trouvée.")
+        return
+    if not words:
+        print(f"[!] Erreur: Wordlist '{args.wordlist}' est vide.")
+        return
+
+    # Charger les extensions de base
+    try:
+        with open(args.extensions, 'r', encoding='utf-8', errors='ignore') as f:
+            base_extensions = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+    except FileNotFoundError:
+        print(f"[!] Erreur: Fichier d'extensions '{args.extensions}' non trouvé.")
+        return
+    if not base_extensions:
+        print(f"[!] Erreur: Fichier d'extensions '{args.extensions}' est vide.")
+        return
+
+    # Détection du serveur et adaptation des extensions
+    print("[*] Détection du serveur et adaptation des extensions...")
+    server_info = detect_server_and_cms(args.target_url)
+    print(f"[*] Serveur détecté: {server_info['type']} ({server_info['details']})")
+    if server_info['cms']:
+        print(f"[*] CMS détectés: {', '.join(server_info['cms'])}")
+    
+    final_extensions = adapt_extensions(base_extensions, server_info)
+    if len(final_extensions) != len(base_extensions):
+        print(f"[*] Extensions adaptées pour le serveur/CMS. Nombre total d'extensions à tester: {len(final_extensions)}")
+    else:
+        print(f"[*] Utilisation de la liste d'extensions de base. Nombre total d'extensions à tester: {len(final_extensions)}")
+    # print(f"[*] Extensions finales: {final_extensions[:10]}...") # Debug
+
+    # Gestion de robots.txt pour le mode furtif
+    robots_manager = None
+    user_agent_for_robots = get_random_user_agent() # Utiliser un agent utilisateur cohérent pour robots.txt
+    if args.stealth:
+        print("[*] Analyse de robots.txt...")
+        robots_manager = RobotsManager(args.target_url)
+        # Test:
+        # if robots_manager.can_fetch(user_agent_for_robots, "/private/"):
+        #     print("[*] /private/ est autorisé")
+        # else:
+        #     print("[*] /private/ est interdit par robots.txt")
+
+
+    # Initialiser la file de tâches
+    path_queue = Queue()
+    for word in words:
+        path_queue.put(word)
+
+    print(f"\n[*] Démarrage du scan avec {args.threads} threads...")
+    start_time = time.time()
+
+    # Démarrer les threads travailleurs
+    threads_list = []
+    for _ in range(args.threads):
+        thread = threading.Thread(target=scan_worker, args=(
+            args.target_url,
+            path_queue,
+            final_extensions,
+            args.stealth,
+            args.stealth_delay if args.stealth else 0,
+            robots_manager if args.stealth else None,
+            user_agent_for_robots if args.stealth else "*"
+        ))
+        threads_list.append(thread)
+        thread.start()
+
+    # Attendre que la file soit vide (toutes les tâches initiales distribuées)
+    path_queue.join()
+
+    # Attendre que tous les threads aient terminé
+    for t in threads_list:
+        t.join()
+
+    end_time = time.time()
+    scan_duration = end_time - start_time
+
+    print("\n--- Scan Terminé ---")
+    print(f"[*] Temps total du scan: {scan_duration:.2f} secondes")
+    print(f"[*] URL Cible: {args.target_url}")
+    print(f"[*] Mode de scan: {'Furtif' if args.stealth else 'Agressif'}")
+    print(f"[*] Requêtes totales effectuées: {total_requests_made}")
+    
+    results_200 = [r for r in found_results if r['status'] == 200]
+    print(f"[*] Nombre de résultats 200 OK: {len(results_200)}")
+
+    if results_200:
+        output_files, results_dir_path = save_results(results_200, target_domain)
+        if output_files:
+            print(f"[*] Résultats sauvegardés dans le répertoire: {results_dir_path}")
+            for f_name in output_files:
+                print(f"    - {os.path.basename(f_name)}")
+        else:
+            print("[*] Aucun fichier de résultat n'a été créé (pas de 200 OK).")
+    else:
+        print("[*] Aucun résultat avec le statut 200 OK trouvé.")
+
+    print("\n--- Informations Serveur et Extensions ---")
+    print(f"[*] Type de serveur détecté: {server_info['type']}")
+    if server_info['details']:
+        print(f"    - En-tête Server: {server_info['details']}")
+    if server_info['cms']:
+        print(f"[*] CMS potentiels détectés: {', '.join(server_info['cms'])}")
+    
+    if len(final_extensions) != len(base_extensions):
+        print("[*] Les extensions ont été adaptées en fonction des informations du serveur.")
+        # On pourrait lister les extensions ajoutées/priorisées ici si besoin
+    else:
+        print("[*] La liste d'extensions de base a été utilisée sans adaptation majeure (ou serveur non identifié pour adaptation).")
+
+if __name__ == "__main__":
+    main()

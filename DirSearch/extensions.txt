@@ -1,0 +1,56 @@
+# Web
+.html
+.htm
+.php
+.asp
+.aspx
+.jsp
+.cgi
+.pl
+.py
+.rb
+.js
+.css
+.json
+.xml
+.txt
+.md
+# Backup
+.bak
+.old
+.zip
+.tar.gz
+.tgz
+.rar
+.7z
+.sql
+.dump
+.bkp
+.save
+# Config
+.conf
+.config
+.ini
+.cfg
+.env
+.yaml
+.yml
+# Database
+.db
+.sqlite
+.mdb
+# Archives
+.tar
+.gz
+# Server-specific (will be adapted)
+.aspx
+.asmx
+.config
+.dll
+.php
+.py
+.rb
+.pl
+# CMS Specific (will be adapted)
+wp-config.php
+configuration.php 
