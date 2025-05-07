@@ -13,6 +13,7 @@ import sys
 import subprocess
 import shutil
 import json
+import ssl
 
 try:
     from prompt_toolkit import PromptSession
@@ -253,150 +254,208 @@ def discover_web_services(target_host, ports_to_scan=None, no_color_mode=False):
 def run_feroxbuster(target_url, no_color_mode=False):
     """Exécute Feroxbuster sur l'URL cible et retourne les URLs 200 OK."""
     global found_results
+
     if not check_command_exists("feroxbuster"):
-        return []
+        print(f"{Colors.YELLOW if not no_color_mode else ''}[-] Feroxbuster n'est pas installé. Étape sautée pour {target_url}{Colors.ENDC if not no_color_mode else ''}")
+        return
 
     print(f"[*] Lancement de Feroxbuster sur {target_url}...")
-    # Utiliser un fichier de sortie temporaire pour les résultats JSON
-    # Nettoyer le nom de domaine pour le nom de fichier
+    
+    # Test de connectivité simple avant de lancer feroxbuster
+    try:
+        requests.head(target_url, timeout=5, allow_redirects=True, headers={'User-Agent': get_random_user_agent()})
+        print(f"  [+] Connectivité initiale à {target_url} confirmée.")
+    except requests.exceptions.RequestException as e:
+        print(f"{Colors.RED if not no_color_mode else ''}[-] Échec de la connexion initiale à {target_url} depuis Python: {e}{Colors.ENDC if not no_color_mode else ''}")
+        print(f"{Colors.YELLOW if not no_color_mode else ''}[-] Feroxbuster sera probablement aussi en échec. Étape sautée.{Colors.ENDC if not no_color_mode else ''}")
+        return
+
+    # Nom de fichier de sortie unique pour éviter les conflits si plusieurs services sur le même hôte/port
     parsed_url = urlparse(target_url)
-    safe_filename = f"ferox_{parsed_url.netloc.replace(':', '_')}_{parsed_url.scheme}.json"
+    hostname_sanitized = parsed_url.hostname.replace('.', '_')
+    port_sanitized = f"_{parsed_url.port}" if parsed_url.port else ""
+    protocol_sanitized = parsed_url.scheme
+    output_filename = f"ferox_{hostname_sanitized}{port_sanitized}_{protocol_sanitized}.json"
     
-    # Commande Feroxbuster : -u URL, -C 200 (codes de statut), -o fichier_json, -k (ignorer erreurs SSL), -q (silencieux)
-    # --json pour une sortie structurée facile à parser
-    # -d 1 pour limiter la profondeur initiale, on peut l'augmenter si besoin.
-    # On peut ajouter -w <wordlist> si on veut une wordlist spécifique pour feroxbuster.
-    cmd = ["feroxbuster", "-u", target_url, "--status-codes", "200", "--json", "-o", safe_filename, "-k", "-q", "--no-state"]
+    # Assurer que le répertoire de sortie existe (par exemple, 'ferox_results')
+    ferox_output_dir = "ferox_results"
+    os.makedirs(ferox_output_dir, exist_ok=True)
+    full_output_path = os.path.join(ferox_output_dir, output_filename)
+
+
+    # Commande Feroxbuster
+    # -k pour ignorer les erreurs SSL, -q pour quiet (moins de sortie console), --no-state pour ne pas sauvegarder l'état
+    cmd = ["feroxbuster", "-u", target_url, "--status-codes", "200", "--json", "-o", full_output_path, "-k", "-q", "--no-state"]
     
-    stdout, stderr, ret_code = run_command(cmd, capture_output=False) # Feroxbuster gère sa propre sortie
+    stdout, stderr, ret_code = run_command(cmd)
 
-    ferox_found_urls = []
-    try:
-        if os.path.exists(safe_filename):
-            with open(safe_filename, 'r') as f:
-                for line in f: # Feroxbuster avec --json écrit une ligne JSON par résultat
-                    try:
-                        result = json.loads(line)
-                        if result.get("type") == "response" and result.get("status") == 200:
-                            url = result.get("url")
-                            if url:
-                                ferox_found_urls.append(url)
-                                if not no_color_mode:
-                                    print(f"  {Colors.GREEN}[FEROXBUSTER 200] {url}{Colors.ENDC}")
-                                else:
-                                    print(f"  [FEROXBUSTER 200] {url}")
-                                # Ajout aux résultats globaux
-                                found_results.append({
-                                    'url': url,
-                                    'status': 200,
-                                    'length': result.get("content_length", "N/A"),
-                                    'source': 'feroxbuster'
-                                })
-                    except json.JSONDecodeError:
-                        # Ignorer les lignes qui ne sont pas du JSON valide (ex: résumé)
-                        pass
-            os.remove(safe_filename) # Nettoyer le fichier temporaire
-    except Exception as e:
-        if not no_color_mode:
-            print(f"{Colors.RED}[!] Erreur lors de la lecture des résultats de Feroxbuster: {e}{Colors.ENDC}")
-        else:
-            print(f"[!] Erreur lors de la lecture des résultats de Feroxbuster: {e}")
+    if ret_code != 0:
+        print(f"{Colors.RED if not no_color_mode else ''}[-] Feroxbuster a terminé avec une erreur (code: {ret_code}) pour {target_url}.{Colors.ENDC if not no_color_mode else ''}")
+        if stderr:
+            print(f"{Colors.GRAY if not no_color_mode else ''}  Erreur Feroxbuster: {stderr.strip()}{Colors.ENDC if not no_color_mode else ''}")
+        if os.path.exists(full_output_path) and os.path.getsize(full_output_path) == 0:
+            os.remove(full_output_path) # Supprimer le fichier json vide en cas d'erreur
+        return
 
-    if not ferox_found_urls and not no_color_mode:
-        print(f"{Colors.YELLOW}[-] Feroxbuster n'a trouvé aucun résultat 200 OK pour {target_url}.{Colors.ENDC}")
-    elif not ferox_found_urls and no_color_mode:
-         print(f"[-] Feroxbuster n'a trouvé aucun résultat 200 OK pour {target_url}.")
-    return ferox_found_urls
-
-# --- Logique de Scan ---
-def scan_worker(target_url, path_queue, extensions, stealth_mode, stealth_delay, robots_manager, user_agent_for_robots):
-    """Travailleur qui prend des chemins de la file et les scanne."""
-    global total_requests_made, found_results
-
-    s = requests.Session() # Utiliser une session pour la persistance des connexions (si applicable)
-
-    while not path_queue.empty():
+    ferox_found_count = 0
+    if os.path.exists(full_output_path) and os.path.getsize(full_output_path) > 0:
         try:
-            word = path_queue.get_nowait()
-        except Exception: # queue.Empty n'est pas toujours levé comme attendu avec get_nowait dans certains contextes
-            return
-
-        # Construire le chemin de base (sans extension)
-        base_path_to_check = f"{target_url.rstrip('/')}/{word}"
-
-        # 1. Vérifier le chemin/répertoire sans extension
-        if not stealth_mode or (robots_manager and robots_manager.can_fetch(user_agent_for_robots, word)):
-            make_request(s, base_path_to_check, stealth_mode, stealth_delay, word, "")
-        
-        # 2. Vérifier avec les extensions
-        for ext in extensions:
-            # Si l'extension est un nom de fichier complet (ex: wp-config.php),
-            # elle doit être testée à la racine du mot (qui pourrait être un répertoire)
-            if not ext.startswith('.'): 
-                path_to_check = f"{target_url.rstrip('/')}/{word}/{ext.lstrip('/')}"
-            else: # Extension classique
-                path_to_check = f"{target_url.rstrip('/')}/{word}{ext}"
+            with open(full_output_path, 'r') as f:
+                data = json.load(f)
             
-            # Construire le chemin relatif pour robots.txt
-            relative_path_for_robots = f"{word}{ext}" if ext.startswith('.') else f"{word}/{ext.lstrip('/')}"
+            if "results" in data and data["results"]:
+                for entry in data["results"]:
+                    if entry.get("type") == "file" and entry.get("status_code") == 200:
+                        url = entry.get("url")
+                        if url:
+                            # Extraire l'extension pour la sauvegarde
+                            path_component = urlparse(url).path
+                            _root, file_ext = os.path.splitext(path_component)
+                            
+                            with lock: # found_results est partagé
+                                found_results.append({
+                                    'url': url, 
+                                    'status': 200, 
+                                    'source': 'feroxbuster',
+                                    'ext': file_ext if file_ext else '.no_ext_ferox' # Fournir une extension
+                                })
+                            ferox_found_count += 1
+                            if not no_color_mode:
+                                print(f"  {Colors.GREEN}[FEROX] 200 OK: {url}{Colors.ENDC}")
+                            else:
+                                print(f"  [FEROX] 200 OK: {url}")
+            # Ne pas supprimer le fichier JSON s'il contient des données valides
+            # os.remove(full_output_path) # Optionnel: supprimer après traitement
+        except json.JSONDecodeError:
+            print(f"{Colors.RED if not no_color_mode else ''}[-] Erreur de décodage du fichier JSON de Feroxbuster: {full_output_path}{Colors.ENDC if not no_color_mode else ''}")
+        except Exception as e:
+            print(f"{Colors.RED if not no_color_mode else ''}[-] Erreur lors du traitement du fichier Feroxbuster {full_output_path}: {e}{Colors.ENDC if not no_color_mode else ''}")
 
-            if not stealth_mode or (robots_manager and robots_manager.can_fetch(user_agent_for_robots, relative_path_for_robots)):
-                make_request(s, path_to_check, stealth_mode, stealth_delay, word, ext)
-            else:
-                with print_lock:
-                    print(f"[*] Ignoré par robots.txt: {path_to_check}")
+
+    if ferox_found_count == 0:
+        print(f"[-] Feroxbuster n'a trouvé aucun résultat 200 OK (type fichier) pour {target_url}.")
+        # Supprimer le fichier JSON s'il est vide ou ne contient pas de résultats pertinents
+        if os.path.exists(full_output_path) and ferox_found_count == 0 :
+             try:
+                 # Vérifier si le fichier est vraiment vide ou ne contient que des messages et pas de "results"
+                 is_empty_or_no_results = True
+                 if os.path.getsize(full_output_path) > 0:
+                     with open(full_output_path, 'r') as f_check:
+                         content_check = f_check.read()
+                         if '"results": [' in content_check and ']' in content_check.split('"results": [')[1]: # simple check
+                             is_empty_or_no_results = False # Il y a une section results
+                 if is_empty_or_no_results:
+                    os.remove(full_output_path)
+             except Exception:
+                 pass # Ne pas crasher si la suppression échoue
+
+# --- Scan par Wordlist pour un Service Spécifique ---
+def perform_wordlist_scan_for_service(service_url, wordlist_file, extensions_file, num_threads, 
+                                      stealth_mode, stealth_delay_val, user_agents_file_path, no_color_mode):
+    """
+    Effectue un scan de contenu basé sur une wordlist pour une URL de service web donnée.
+    """
+    global total_requests_made # Utilise le compteur global
+
+    print(f"[*] Démarrage du scan par wordlist pour {service_url}...")
+
+    # Charger la wordlist
+    words = load_wordlist(wordlist_file, no_color_mode)
+    if not words:
+        print(f"{Colors.YELLOW if not no_color_mode else ''}[-] Wordlist vide ou non chargée. Scan par wordlist sauté pour {service_url}.{Colors.ENDC if not no_color_mode else ''}")
+        return
+
+    # Charger les extensions
+    base_extensions = load_extensions(extensions_file, no_color_mode)
+
+    # Détection du serveur et adaptation des extensions pour CE service
+    if not no_color_mode:
+        print(f"[*] Détection du serveur et adaptation des extensions pour {Colors.CYAN}{service_url}{Colors.ENDC}...")
+    else:
+        print(f"[*] Détection du serveur et adaptation des extensions pour {service_url}...")
         
-        path_queue.task_done()
+    server_info = detect_server_and_cms(service_url) # Utilise service_url
+    if not no_color_mode:
+        print(f"[*] Serveur détecté: {Colors.GREEN}{server_info['type']}{Colors.ENDC} ({server_info['details']})")
+        if server_info['cms']:
+            print(f"[*] CMS détectés: {Colors.GREEN}{', '.join(server_info['cms'])}{Colors.ENDC}")
+    else:
+        print(f"[*] Serveur détecté: {server_info['type']} ({server_info['details']})")
+        if server_info['cms']:
+            print(f"[*] CMS détectés: {', '.join(server_info['cms'])}")
 
-def make_request(session, url_to_check, stealth_mode, stealth_delay, original_word, original_ext):
-    """Effectue une requête HTTP et gère la réponse."""
-    global total_requests_made, found_results
-    
-    headers = {'User-Agent': get_random_user_agent()}
-    
-    if stealth_mode and stealth_delay > 0:
-        time.sleep(random.uniform(stealth_delay * 0.5, stealth_delay * 1.5))
+    final_extensions = adapt_extensions(base_extensions, server_info)
+    if len(final_extensions) != len(base_extensions) and not no_color_mode:
+        print(f"[*] Extensions adaptées. Total extensions à tester: {Colors.YELLOW}{len(final_extensions)}{Colors.ENDC}")
+    elif not no_color_mode:
+        print(f"[*] Utilisation des extensions de base. Total extensions à tester: {Colors.YELLOW}{len(final_extensions)}{Colors.ENDC}")
+    else: # no_color_mode
+        if len(final_extensions) != len(base_extensions):
+             print(f"[*] Extensions adaptées. Total extensions à tester: {len(final_extensions)}")
+        else:
+             print(f"[*] Utilisation des extensions de base. Total extensions à tester: {len(final_extensions)}")
 
-    try:
-        with lock:
-            total_requests_made += 1
+
+    # Gestion de robots.txt pour le mode furtif pour CE service
+    robots_manager = None
+    user_agent_for_robots = get_random_user_agent() 
+    if stealth_mode:
+        if not no_color_mode:
+            print(f"[*] Analyse de robots.txt pour {Colors.CYAN}{service_url}{Colors.ENDC}...")
+        else:
+            print(f"[*] Analyse de robots.txt pour {service_url}...")
+        robots_manager = RobotsManager(service_url) # Utilise service_url
+
+    # Initialiser la file de tâches
+    path_queue = Queue()
+    for word in words:
+        path_queue.put(word)
+
+    if not no_color_mode:
+        print(f"\n[*] Démarrage du scan (wordlist) avec {Colors.YELLOW}{num_threads}{Colors.ENDC} threads pour {Colors.CYAN}{service_url}{Colors.ENDC}...")
+    else:
+        print(f"\n[*] Démarrage du scan (wordlist) avec {num_threads} threads pour {service_url}...")
         
-        response = session.get(url_to_check, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True, stream=True)
-        response.close()
+    service_scan_start_time = time.time()
 
-        status_code = response.status_code
-        content_length = response.headers.get('Content-Length', 'N/A')
+    # Démarrer les threads travailleurs
+    threads_list = []
+    for _ in range(num_threads):
+        thread = threading.Thread(target=scan_worker, args=(
+            service_url, # Cible spécifique au service
+            path_queue,
+            final_extensions,
+            stealth_mode,
+            stealth_delay_val if stealth_mode else 0,
+            robots_manager if stealth_mode else None,
+            user_agent_for_robots if stealth_mode else "*", # Agent pour robots.txt
+            no_color_mode
+        ))
+        threads_list.append(thread)
+        thread.start()
 
-        color = Colors.WHITE
-        if 200 <= status_code < 300:
-            color = Colors.GREEN
-        elif 300 <= status_code < 400:
-            color = Colors.YELLOW
-        elif status_code == 403:
-            color = Colors.LIGHT_RED
-        elif status_code == 401:
-            color = Colors.MAGENTA
-        elif status_code == 404:
-            color = Colors.GRAY
-        elif status_code >= 500:
-            color = Colors.RED
+    # Attendre que la file soit vide
+    path_queue.join()
 
-        with print_lock:
-            # Affichage plus concis, on a déjà le contexte du service
-            status_colored = f"{color}{status_code}{Colors.ENDC}"
-            path_segment = urlparse(url_to_check).path
-            print(f"  [{status_colored}] {path_segment} (Longueur: {content_length})")
+    # Attendre que tous les threads aient terminé
+    for t in threads_list:
+        t.join()
 
-        if 200 <= status_code < 300 or status_code in [401, 403]: # Sauvegarder aussi 401/403
-            with lock:
-                found_results.append({
-                    'url': url_to_check,
-                    'status': status_code,
-                    'length': content_length,
-                    'source': 'wordlist' # Ajout de la source
-                })
-    except requests.exceptions.RequestException:
-        pass
+    service_scan_duration = time.time() - service_scan_start_time
+    if not no_color_mode:
+        print(f"\n--- Scan par wordlist terminé pour {Colors.CYAN}{service_url}{Colors.ENDC} ---")
+        print(f"[*] Temps du scan par wordlist: {Colors.YELLOW}{service_scan_duration:.2f} secondes{Colors.ENDC}")
+    else:
+        print(f"\n--- Scan par wordlist terminé pour {service_url} ---")
+        print(f"[*] Temps du scan par wordlist: {service_scan_duration:.2f} secondes")
+
+    # Les résultats sont ajoutés à la liste globale `found_results` par `scan_worker`
+    # Le comptage `total_requests_made` est aussi global et incrémenté par `scan_worker`
+
+# --- Scan d'un chemin unique ---
+def scan_path(target_url, path, extensions_to_try, stealth_mode, delay, robots_manager, user_agent_for_robots, no_color_mode):
+    # Implementation of scan_path function
+    pass
 
 # --- Gestion des Résultats ---
 def save_results(results, target_domain):
@@ -439,7 +498,7 @@ def save_results(results, target_domain):
 
 # --- Fonction Principale (Modifiée) ---
 def main():
-    global total_requests_made, found_results, USER_AGENTS # USER_AGENTS est global
+    global total_requests_made, found_results, USER_AGENTS
 
     parser = argparse.ArgumentParser(description="Outil de découverte de contenu web automatisé et intelligent.")
     # L'argument principal est maintenant l'hôte/IP, pas une URL complète.
@@ -513,7 +572,7 @@ def main():
             args.threads,
             args.stealth,
             args.stealth_delay,
-            args.user_agents, # Déjà chargé, mais passé pour info ou rechargement si besoin
+            args.user_agents, 
             args.no_color
         )
         service_end_time = time.time()
@@ -552,6 +611,4 @@ def main():
     # On pourrait faire un résumé ici si nécessaire.
 
 if __name__ == "__main__":
-    # Ajout pour la détection SSL dans discover_web_services
-    import ssl
     main()

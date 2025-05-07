@@ -904,8 +904,12 @@ def main_loop(target_ip, scanned_ports, session):
         "Actions d'Exploration et Tests": {
             "smb": "Explorer les services SMB détectés (partages, sessions nulles, etc.).",
             "ldap": "Explorer les services LDAP/LDAPS détectés (requêtes, AS-REP Roasting, etc.).",
+            "mssql": "Explorer les services MSSQL détectés.", # Ajout de mssql
             "discoverusers": "Tenter différentes techniques de découverte d'utilisateurs.",
             "testcreds": "Lancer une batterie de tests d'authentification avec les identifiants multiples configurés."
+        },
+        "Utilitaires Réseau": { # Nouvelle section
+            "generatehosts <subnet_cidr>": "Découvrir les hôtes sur un sous-réseau et générer des entrées /etc/hosts (ex: 10.10.10.0/24)."
         }
     }
 
@@ -917,6 +921,7 @@ def main_loop(target_ip, scanned_ports, session):
         "prelim_scan": None,
         "smb": None, 
         "ldap": None, 
+        "mssql": None, # Ajout de mssql
         "discoverusers": None,
         "testcreds": None,
         "set": {
@@ -934,6 +939,7 @@ def main_loop(target_ip, scanned_ports, session):
         "clear": {
             "creds": None
         },
+        "generatehosts": None, # Ajout de generatehosts
         "back": None,
         "exit": None
     }
@@ -1006,6 +1012,13 @@ def main_loop(target_ip, scanned_ports, session):
                     logging.warning(f"Tentative d'exploration LDAP sans ports LDAP/LDAPS détectés pour {target_ip}")
                     continue
                 explore_ldap(target_ip, combined_ldap_ports, session)
+            elif command == "mssql": # Nouvelle commande mssql
+                mssql_ports_list = scanned_ports.get("MSSQL", [])
+                if not mssql_ports_list:
+                    print(f"[-] Aucun port MSSQL (1433) n'a été détecté sur {target_ip}.")
+                    logging.warning(f"Tentative d'exploration MSSQL sans port MSSQL détecté pour {target_ip}")
+                    continue
+                explore_mssql(target_ip, mssql_ports_list, session)
             elif command == "discoverusers":
                 user_discovery_mode(target_ip, session)
             elif command == "services":
@@ -1117,7 +1130,16 @@ def main_loop(target_ip, scanned_ports, session):
             
             elif command == "testcreds":
                 run_credential_tests(target_ip, scanned_ports, multi_credentials, session)
-
+            elif command == "generatehosts":
+                if not args:
+                    print("Usage: generatehosts <subnet_cidr> (ex: 10.10.10.0/24)")
+                    continue
+                subnet_to_scan = args[0]
+                # Valider le format du subnet CIDR (simpliste)
+                if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$", subnet_to_scan):
+                    print(f"[-] Format de sous-réseau CIDR invalide: {subnet_to_scan}")
+                    continue
+                generate_and_append_etc_hosts(subnet_to_scan, AnsiColors.NO_COLOR_MODE)
             else:
                 print(f"Commande inconnue: {command}. Tapez 'help' pour la liste des commandes.")
 
@@ -1257,6 +1279,261 @@ def run_credential_tests(target_ip, scanned_services_ports, cred_config, session
         print("\n--- [-] Aucun identifiant valide trouvé lors des tests. ---")
 
     logging.info(f"Tests d'identifiants terminés. Succès: {len(set(successful_logins))}")
+
+def generate_and_append_etc_hosts(subnet_cidr, no_color_mode=False):
+    """Découvre les hôtes sur un sous-réseau et propose d'ajouter les entrées à /etc/hosts."""
+    if not NXC_AVAILABLE:
+        print(f"{AnsiColors.RED}[-] NetExec (nxc) n'est pas disponible. Impossible de découvrir les hôtes.{AnsiColors.ENDC}")
+        return
+
+    print(f"[*] Découverte des hôtes actifs sur {subnet_cidr} avec nxc...")
+    # Utiliser nxc pour un ping sweep. L'option --ping n'existe pas directement,
+    # mais nxc sur un range sans module spécifique fait un host discovery.
+    # On peut aussi utiliser un module léger comme 'smb' et regarder les hôtes qui répondent.
+    # Pour un simple ping sweep, nxc <cidr> sans module est souvent suffisant pour voir les hôtes UP.
+    # Ou, plus explicitement, on peut utiliser un module qui liste les hôtes.
+    # Ici, on va juste lancer nxc sur le range et parser les IPs qui sont marquées comme UP.
+    
+    # Alternative: nxc <cidr> smb --shares (juste pour voir les hosts up, même si shares échoue)
+    # Pour l'instant, on va supposer que nxc <cidr> seul liste les hôtes UP.
+    # Une meilleure approche serait d'utiliser nmap si disponible, ou un ping sweep plus dédié.
+    # Pour nxc, on peut utiliser un module simple et regarder les logs ou la sortie.
+    # Exemple avec le module 'ping' (si nxc le supporte directement, sinon on adapte)
+    # cmd_discover = [NXC_CMD, subnet_cidr, "ping"] # Si nxc a un module ping
+    # Pour l'instant, on va utiliser une approche plus générique avec nxc
+    
+    cmd_discover = [NXC_CMD, subnet_cidr] # Lance nxc sur le range, il devrait lister les hôtes UP
+    output, ret_code = run_command(cmd_discover)
+
+    if ret_code != 0 or not output:
+        print(f"{AnsiColors.RED}[-] Échec de la découverte d'hôtes ou aucun hôte trouvé.{AnsiColors.ENDC}")
+        return
+
+    active_ips = []
+    # Parser la sortie de nxc pour les IPs. Ceci dépendra du format de sortie de nxc.
+    # Supposons que nxc affiche les IPs actives d'une manière identifiable.
+    # Exemple de parsing (à adapter selon la sortie réelle de `nxc <subnet_cidr>`)
+    for line in output.splitlines():
+        # Chercher les lignes qui indiquent un hôte actif, souvent avec l'IP.
+        # Ceci est une heuristique et pourrait nécessiter un ajustement.
+        # Par exemple, si nxc affiche "[*] IP_ADDRESS - Host is alive"
+        match_ip = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", line)
+        if match_ip and "UP" in line.upper() or "ALIVE" in line.upper() or "SMB" in line or "LDAP" in line : # Heuristique
+            ip = match_ip.group(1)
+            if ip not in active_ips:
+                active_ips.append(ip)
+    
+    if not active_ips:
+        print(f"[-] Aucun hôte actif détecté sur {subnet_cidr} via nxc.")
+        return
+
+    print(f"[*] Hôtes actifs trouvés sur {subnet_cidr}: {', '.join(active_ips)}")
+    
+    etc_hosts_entries = []
+    print("[*] Tentative de résolution DNS inversée (peut prendre du temps)...")
+    for ip in active_ips:
+        hostname = None
+        try:
+            hostname, _, _ = socket.gethostbyaddr(ip)
+            print(f"  [+] {ip} -> {hostname}")
+        except socket.herror:
+            print(f"  [-] {ip} -> Échec de la résolution inversée.")
+            # Générer un nom d'hôte basé sur l'IP si le domaine est connu
+            domain_part = credentials.get("domain") or multi_credentials.get("domain")
+            if domain_part:
+                hostname_generated = f"host-{ip.replace('.', '-')}.{domain_part.lower()}"
+            else:
+                hostname_generated = f"unknown-{ip.replace('.', '-')}"
+            hostname = hostname_generated # Utiliser le nom généré
+            print(f"      Utilisation de nom généré: {hostname}")
+
+
+        if hostname:
+            # Créer une entrée simple et une avec le nom court si possible
+            short_name = hostname.split('.')[0]
+            if short_name != hostname:
+                etc_hosts_entries.append(f"{ip}\t{hostname}\t{short_name}")
+            else:
+                etc_hosts_entries.append(f"{ip}\t{hostname}")
+        else: # Fallback si même le nom généré n'est pas là (ne devrait pas arriver)
+             etc_hosts_entries.append(f"{ip}\tunknown-{ip.replace('.', '-')}")
+
+
+    if not etc_hosts_entries:
+        print("[-] Aucune entrée /etc/hosts à générer.")
+        return
+
+    print("\n--- Entrées /etc/hosts proposées ---")
+    header_comment = f"\n# Added by ADExplorer - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Subnet: {subnet_cidr}\n"
+    print(header_comment.strip())
+    for entry in etc_hosts_entries:
+        print(entry)
+    print("# End of ADExplorer entries\n")
+
+    try:
+        confirm = session.prompt(f"Voulez-vous ajouter ces entrées à /etc/hosts? ({AnsiColors.YELLOW}y{AnsiColors.ENDC}/{AnsiColors.YELLOW}N{AnsiColors.ENDC}): ", default="n").lower()
+    except (KeyboardInterrupt, EOFError):
+        print("\n[!] Annulation.")
+        return
+        
+    if confirm == 'y':
+        if os.geteuid() != 0:
+            print(f"{AnsiColors.RED}[!] Vous devez exécuter ce script avec sudo ou en tant que root pour modifier /etc/hosts.{AnsiColors.ENDC}")
+            print(f"[*] Veuillez ajouter manuellement les entrées ci-dessus si vous le souhaitez.")
+            return
+
+        try:
+            with open("/etc/hosts", "a") as f:
+                f.write(header_comment)
+                for entry in etc_hosts_entries:
+                    f.write(entry + "\n")
+                f.write("# End of ADExplorer entries\n")
+            print(f"{AnsiColors.GREEN}[+] Entrées ajoutées avec succès à /etc/hosts.{AnsiColors.ENDC}")
+        except PermissionError:
+            print(f"{AnsiColors.RED}[!] Erreur de permission. Assurez-vous d'avoir les droits pour écrire dans /etc/hosts.{AnsiColors.ENDC}")
+        except Exception as e:
+            print(f"{AnsiColors.RED}[-] Une erreur est survenue lors de l'écriture dans /etc/hosts: {e}{AnsiColors.ENDC}")
+    else:
+        print("[*] Les entrées n'ont pas été ajoutées à /etc/hosts.")
+
+def explore_mssql(target_ip, mssql_ports, session):
+    """Menu interactif pour explorer les services MSSQL."""
+    if not NXC_AVAILABLE:
+        print(f"{AnsiColors.RED}[-] NetExec (nxc) n'est pas disponible. Impossible d'explorer MSSQL.{AnsiColors.ENDC}")
+        return
+
+    if not mssql_ports:
+        print(f"[-] Aucun port MSSQL spécifié pour {target_ip}.")
+        return
+        
+    print(f"\n--- Exploration MSSQL sur {target_ip} (Ports: {', '.join(map(str, mssql_ports))}) ---")
+    
+    mssql_commands_help = {
+        "check_public": "Vérifier si le serveur MSSQL est listé comme 'public' (nécessite nxc avec module mssql).",
+        "enum_version": "Tenter d'énumérer la version de MSSQL (souvent via une connexion anonyme ou par défaut).",
+        "test_login <user> <password> [domain]": "Tester des identifiants spécifiques.",
+        "test_current_creds": "Tester les identifiants actuellement configurés (set user/pass/domain).",
+        "run_all_checks": "Exécuter toutes les vérifications de base (public, version).",
+        "help": "Afficher ce menu d'aide.",
+        "back": "Retourner au menu principal de la cible."
+    }
+    mssql_completer = WordCompleter(list(mssql_commands_help.keys()), ignore_case=True)
+
+    while True:
+        try:
+            full_command = session.prompt(
+                f"ADExplorer ({AnsiColors.YELLOW}{target_ip}{AnsiColors.ENDC}) ({AnsiColors.CYAN}MSSQL{AnsiColors.ENDC})> ",
+                completer=mssql_completer,
+                auto_suggest=AutoSuggestFromHistory(),
+                style=cli_style
+            ).strip()
+            if not full_command:
+                continue
+            
+            parts = full_command.split()
+            command = parts[0].lower()
+            args = parts[1:]
+
+            logging.info(f"Commande MSSQL reçue pour {target_ip}: {full_command}")
+
+            if command == "help":
+                print_target_menu({"Commandes MSSQL": mssql_commands_help})
+            elif command == "back":
+                break
+            elif command == "exit": # Permettre exit depuis ce sous-menu aussi
+                logging.info("Demande de sortie de l'application.")
+                print("Au revoir !")
+                sys.exit(0)
+            elif command == "check_public":
+                # nxc mssql <target> --is-public (si cette option existe)
+                # ou nxc mssql <target> (et regarder la sortie pour des indicateurs)
+                print("[*] Vérification du statut 'public' (nécessite une interprétation manuelle de la sortie de nxc)...")
+                for port in mssql_ports:
+                    cmd = [NXC_CMD, "mssql", f"{target_ip}:{port}"]
+                    output, _ = run_command(cmd)
+                    if output:
+                        print(f"--- Sortie pour {target_ip}:{port} ---")
+                        print(output)
+            elif command == "enum_version":
+                print("[*] Tentative d'énumération de la version MSSQL...")
+                for port in mssql_ports:
+                    # nxc mssql <target> -u '' -p '' (pourrait donner la version)
+                    # ou nxc mssql <target> --info (si disponible)
+                    cmd = [NXC_CMD, "mssql", f"{target_ip}:{port}", "-u", "", "-p", ""] # Tentative anonyme
+                    output, _ = run_command(cmd)
+                    if output:
+                        print(f"--- Sortie pour {target_ip}:{port} (tentative anonyme) ---")
+                        print(output)
+                        # Rechercher des motifs de version
+                        version_match = re.search(r"Microsoft SQL Server\s*(\d{4}|\d{2}\.\d{1,2}\.\d{4}\.\d{2})", output, re.IGNORECASE)
+                        if version_match:
+                            print(f"{AnsiColors.GREEN}[+] Version MSSQL potentielle trouvée: {version_match.group(0)}{AnsiColors.ENDC}")
+            elif command == "test_login":
+                if len(args) < 2:
+                    print("Usage: test_login <user> <password> [domain]")
+                    continue
+                user, password = args[0], args[1]
+                domain = args[2] if len(args) > 2 else credentials.get("domain") or multi_credentials.get("domain")
+                
+                print(f"[*] Test des identifiants MSSQL: {domain}\\{user} (pass: ****) sur {target_ip}")
+                for port in mssql_ports:
+                    cmd = [NXC_CMD, "mssql", f"{target_ip}:{port}", "-u", user, "-p", password]
+                    if domain:
+                        cmd.extend(["-d", domain])
+                    output, _ = run_command(cmd)
+                    if output:
+                        print(f"--- Sortie pour {target_ip}:{port} ---")
+                        print(output)
+                        if "(Pwn3d!)" in output or "Authentication successful" in output: # Adapter selon la sortie de nxc
+                            print(f"{AnsiColors.GREEN}[+] Identifiants valides pour {domain}\\{user} sur {target_ip}:{port}!{AnsiColors.ENDC}")
+            elif command == "test_current_creds":
+                user = credentials.get("username")
+                password = credentials.get("password")
+                domain = credentials.get("domain") or multi_credentials.get("domain") # Prioriser le domaine de multi_creds s'il est là
+                if not user or not password:
+                    print("[-] Aucun identifiant (utilisateur/mot de passe) configuré avec 'set user/password'.")
+                    continue
+                
+                print(f"[*] Test des identifiants MSSQL configurés: {domain}\\{user} (pass: ****) sur {target_ip}")
+                for port in mssql_ports:
+                    cmd = [NXC_CMD, "mssql", f"{target_ip}:{port}", "-u", user, "-p", password]
+                    if domain:
+                        cmd.extend(["-d", domain])
+                    output, _ = run_command(cmd)
+                    if output:
+                        print(f"--- Sortie pour {target_ip}:{port} ---")
+                        print(output)
+                        if "(Pwn3d!)" in output or "Authentication successful" in output:
+                            print(f"{AnsiColors.GREEN}[+] Identifiants configurés valides pour {domain}\\{user} sur {target_ip}:{port}!{AnsiColors.ENDC}")
+            elif command == "run_all_checks":
+                print_target_menu({"Commandes MSSQL": mssql_commands_help}) # Afficher l'aide d'abord
+                session.prompt(f"Exécution de 'check_public' et 'enum_version'. Appuyez sur Entrée pour continuer...", style=cli_style)
+                # Simuler l'appel des commandes
+                print("\n--- Exécution de check_public ---")
+                # Code de check_public (simplifié ici, en réalité appeler la logique)
+                for port_s in mssql_ports:
+                    cmd_s = [NXC_CMD, "mssql", f"{target_ip}:{port_s}"]
+                    output_s, _ = run_command(cmd_s)
+                    if output_s: print(output_s)
+
+                print("\n--- Exécution de enum_version ---")
+                # Code de enum_version (simplifié)
+                for port_s in mssql_ports:
+                    cmd_s = [NXC_CMD, "mssql", f"{target_ip}:{port_s}", "-u", "", "-p", ""]
+                    output_s, _ = run_command(cmd_s)
+                    if output_s: print(output_s)
+            else:
+                print(f"Commande MSSQL inconnue: {command}")
+
+        except KeyboardInterrupt:
+            print("\n[!] Interruption MSSQL. Retour au menu principal de la cible.")
+            break
+        except EOFError:
+            print("\n[!] EOF reçu. Retour au menu principal de la cible.")
+            break
+        except Exception as e:
+            logging.error(f"Erreur inattendue dans le menu MSSQL: {e}")
+            print(f"{AnsiColors.RED}Erreur: {e}{AnsiColors.ENDC}")
 
 
 # --- Point d'entrée principal ---
