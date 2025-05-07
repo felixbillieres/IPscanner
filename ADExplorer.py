@@ -161,86 +161,329 @@ def format_status(success, text_if_success="Succès", text_if_failure="Échec"):
 def run_preliminary_scan(target_ip, scanned_ports_info, session):
     """Effectue une série d'énumérations préliminaires rapides et affiche un tableau de statut."""
     logging.info(f"Exécution du scan préliminaire sur {target_ip}")
-    print(f"\n[*] Scan préliminaire Active Directory pour {target_ip}:")
+    print(f"\n[*] Scan préliminaire Active Directory pour {AnsiColors.CYAN}{target_ip}{AnsiColors.ENDC}:")
 
-    results = []
+    prelim_results = [] # Liste pour stocker les dictionnaires de résultats
 
-    # 1. Test de connexion LDAP anonyme
-    ldap_anon_success = False
-    ldap_domain_name = "N/A"
-    # Vérifier si le port LDAP est ouvert avant de tester
-    if 389 in scanned_ports_info.get("LDAP", []): # Accès corrigé
-        print("[*] Test de la liaison LDAP anonyme...")
-        # Remplacement de --trusted-domain par --namingcontexts ou une simple vérification
-        # cmd_ldap_anon = [NXC_CMD, "ldap", target_ip, "-u", "''", "-p", "''", "--trusted-domain"]
-        cmd_ldap_anon = [NXC_CMD, "ldap", target_ip, "-u", "", "-p", "", "--info"] # --info est plus général
-        output, ret_code = run_command(cmd_ldap_anon)
+    # Helper pour ajouter les résultats
+    def add_result(description, status, details=""):
+        prelim_results.append({"description": description, "status": status, "details": details})
 
-        # Une meilleure vérification du succès pour la liaison anonyme
-        # Souvent, si la commande ne retourne pas d'erreur explicite de login et affiche des infos, c'est un succès.
-        # Pour nxc, une absence d'erreur et la présence d'informations de base est un bon signe.
-        if ret_code == 0 and output: # Si la commande s'exécute sans erreur et retourne quelque chose
-            ldap_anon_success = True
-            # Essayer d'extraire le nom de domaine (simpliste)
-            match_dns_domain = re.search(r"Domain:\s*([\w.-]+)", output, re.IGNORECASE)
-            if match_dns_domain:
-                ldap_domain_name = match_dns_domain.group(1)
-            else:
-                # Tenter d'extraire de defaultNamingContext ou dNSHostName
-                match_naming_context = re.search(r"defaultNamingContext:\s*(DC=[\w,-]+)", output, re.IGNORECASE)
-                if match_naming_context:
-                    ldap_domain_name = match_naming_context.group(1).replace("DC=", "").replace(",", ".")
-                else:
-                    match_host = re.search(r"dNSHostName:\s*([\w.-]+)", output, re.IGNORECASE)
-                    if match_host:
-                        # Ceci est le FQDN de la machine, pas nécessairement le domaine AD, mais mieux que rien
-                        ldap_domain_name = ".".join(match_host.group(1).split('.')[1:]) if '.' in match_host.group(1) else match_host.group(1)
-            if ldap_domain_name == "N/A" and "namingContexts" in output: # Fallback si on a des naming contexts
-                ldap_domain_name = "Infos NamingContext trouvées"
+    # 1. Test de connexion LDAP anonyme et extraction d'infos
+    ldap_ports_to_try = scanned_ports_info.get("LDAP", []) + scanned_ports_info.get("LDAPS", [])
+    if ldap_ports_to_try:
+        ldap_anon_success = False
+        ldap_details = ""
+        domain_from_ldap = None
+        dns_host_from_ldap = None
+        for port in ldap_ports_to_try:
+            # nxc gère ldaps via le port ou --ssl, on passe juste le port.
+            cmd_ldap_anon = [NXC_CMD, "ldap", f"{target_ip}:{port}", "-u", "", "-p", ""]
+            output, ret_code = run_command(cmd_ldap_anon)
+            if output and (ret_code == 0 or "Naming Contexts" in output or "defaultNamingContext" in output or "currentTime" in output):
+                ldap_anon_success = True
+                ldap_details += f"Connexion anonyme réussie sur le port {port}. "
+                
+                dc_match = re.search(r"(?:defaultNamingContext|namingContexts):\s*DC=([^,]+),DC=([^,]+)", output, re.IGNORECASE)
+                if dc_match:
+                    domain_from_ldap = f"{dc_match.group(1)}.{dc_match.group(2)}".lower()
+                    ldap_details += f"Domaine déduit: {domain_from_ldap}. "
+                
+                dns_host_match = re.search(r"dnsHostName:\s*([^\s]+)", output, re.IGNORECASE)
+                if dns_host_match:
+                    dns_host_from_ldap = dns_host_match.group(1)
+                    ldap_details += f"Nom d'hôte DNS: {dns_host_from_ldap}. "
+                
+                # Si un domaine est trouvé et que les credentials globaux n'ont pas de domaine, on le met à jour
+                if domain_from_ldap and not credentials["domain"]:
+                    credentials["domain"] = domain_from_ldap
+                    multi_credentials["domain"] = domain_from_ldap # Aussi pour multi_creds
+                    ldap_details += f"Domaine global mis à jour: {domain_from_ldap}. "
+                break 
+        add_result("Liaison LDAP Anonyme", 
+                   format_status(ldap_anon_success, text_if_failure="Échec/Non Permis"), 
+                   ldap_details.strip())
+    else:
+        add_result("Liaison LDAP Anonyme", f"{AnsiColors.YELLOW}Non testé (port LDAP/S non détecté){AnsiColors.ENDC}")
 
-    results.append(("LDAP Anonyme", ldap_anon_success, f"Domaine/Infos: {ldap_domain_name}" if ldap_anon_success else "Échec de la liaison ou infos non trouvées"))
+    # 2. Scan SMB (Session Nulle - Partages & Heure)
+    smb_ports_to_try = scanned_ports_info.get("SMB", [])
+    if smb_ports_to_try:
+        smb_shares_details = ""
+        smb_time_details = ""
+        smb_shares_success = False
+        smb_time_success = False
 
-    # 2. Test de connexion SMB anonyme (Null Session) & Listage des partages
-    smb_anon_success = False
-    smb_shares_count = 0
-    if 445 in scanned_ports_info.get("SMB", []): # Accès corrigé
-        print("[*] Test de la session SMB nulle et listage des partages...")
-        cmd_smb_null = [NXC_CMD, "smb", target_ip, "-u", "", "-p", "", "--shares"]
-        output, ret_code = run_command(cmd_smb_null)
-        if output and "READ" in output.upper() or "WRITE" in output.upper(): # Un indicateur que des partages ont été listés
-            smb_anon_success = True # Considérer comme un succès si la commande s'exécute et liste quelque chose
-            smb_shares_count = len(re.findall(r"^\s*([\w\-$]+)\s+", output, re.MULTILINE)) # Compte approximatif
+        for port in smb_ports_to_try:
+            # Test des partages en session nulle
+            cmd_smb_shares = [NXC_CMD, "smb", f"{target_ip}:{port}", "-u", "", "-p", "", "--shares"]
+            output_shares, ret_code_shares = run_command(cmd_smb_shares)
+            if output_shares and ret_code_shares == 0: # Succès si nxc retourne 0 et liste des partages
+                smb_shares_success = True
+                found_shares = []
+                for line in output_shares.splitlines():
+                    # Chercher les lignes qui listent des partages (adapter le regex si besoin)
+                    # Exemple de ligne: "READ, WRITE   SHARE_NAME       Description"
+                    # Ou simplement si la sortie contient des noms de partages connus comme IPC$, ADMIN$
+                    if re.search(r"(IPC\$|ADMIN\$|C\$|PRINT\$|SYSVOL|NETLOGON)", line, re.IGNORECASE):
+                        share_name_match = re.match(r"\s*([^\s]+)\s+Disk\s+", line) # Heuristique
+                        if share_name_match:
+                             found_shares.append(share_name_match.group(1))
+                        elif "IPC$" in line: found_shares.append("IPC$ (confirmé)")
 
-    results.append(("SMB Anonyme (Shares)", smb_anon_success, f"{smb_shares_count} partages listés" if smb_anon_success and smb_shares_count > 0 else ("Session nulle possible mais pas de partages listés" if smb_anon_success else "Échec session nulle")))
+                if found_shares:
+                    smb_shares_details += f"Partages trouvés (port {port}): {', '.join(list(set(found_shares)))}. "
+                elif "Listing shares" in output_shares : # nxc a tenté mais n'a rien trouvé ou pas eu accès
+                     smb_shares_details += f"Tentative de listage des partages (port {port}), vérifier la sortie. "
+                else: # Si la commande a réussi mais pas de partages évidents
+                    smb_shares_details += f"Connexion SMB anonyme réussie (port {port}), pas de partages évidents listés. "
+
+
+            # Test de l'heure du serveur
+            cmd_smb_time = [NXC_CMD, "smb", f"{target_ip}:{port}", "-u", "", "-p", "", "--local-auth", "--time"]
+            output_time, ret_code_time = run_command(cmd_smb_time)
+            if output_time and ret_code_time == 0:
+                time_match = re.search(r"Host time:\s*(.*)", output_time, re.IGNORECASE)
+                if time_match:
+                    smb_time_success = True
+                    smb_time_details += f"Heure du serveur (port {port}): {time_match.group(1).strip()}. "
+            if smb_shares_success and smb_time_success: # Si les deux ont réussi sur ce port
+                break
+        
+        add_result("SMB Session Nulle (Partages)", 
+                   format_status(smb_shares_success, text_if_failure="Échec/Non Permis"), 
+                   smb_shares_details.strip())
+        add_result("Heure du Serveur (SMB Anonyme)", 
+                   format_status(smb_time_success, text_if_failure="Échec/Non Obtenue"), 
+                   smb_time_details.strip())
+    else:
+        add_result("SMB Session Nulle (Partages)", f"{AnsiColors.YELLOW}Non testé (port SMB non détecté){AnsiColors.ENDC}")
+        add_result("Heure du Serveur (SMB Anonyme)", f"{AnsiColors.YELLOW}Non testé (port SMB non détecté){AnsiColors.ENDC}")
+
+    # 3. Politique de Mots de Passe (LDAP Anonyme)
+    if ldap_ports_to_try: # Réutiliser les ports LDAP/S
+        pass_pol_success = False
+        pass_pol_details = ""
+        for port in ldap_ports_to_try:
+            cmd_pass_pol = [NXC_CMD, "ldap", f"{target_ip}:{port}", "-u", "", "-p", "", "--pass-pol"]
+            output, ret_code = run_command(cmd_pass_pol)
+            if output and ret_code == 0 and "Password Policy" in output:
+                pass_pol_success = True
+                # Extraire des infos clés (simplifié, nxc donne beaucoup de détails)
+                min_len_match = re.search(r"MinimumPasswordLength:\s*(\d+)", output)
+                lockout_match = re.search(r"LockoutThreshold:\s*(\d+)", output)
+                pass_pol_details += f"Politique trouvée (port {port}). "
+                if min_len_match: pass_pol_details += f"Longueur min: {min_len_match.group(1)}. "
+                if lockout_match: pass_pol_details += f"Seuil verrouillage: {lockout_match.group(1)}. "
+                break
+        add_result("Politique Mots de Passe (LDAP Anonyme)",
+                   format_status(pass_pol_success, text_if_failure="Échec/Non Obtenue"),
+                   pass_pol_details.strip())
+    else:
+        add_result("Politique Mots de Passe (LDAP Anonyme)", f"{AnsiColors.YELLOW}Non testé (port LDAP/S non détecté){AnsiColors.ENDC}")
     
-    # 3. Vérification des ports AD courants (basé sur scanned_ports_info)
-    # scanned_ports_info est déjà le dictionnaire { "SERVICE": [ports] }
-    ad_ports_to_check = {
-        "LDAP (389)": ("LDAP", 389),
-        "LDAPS (636)": ("LDAPS", 636),
-        "SMB (445)": ("SMB", 445), # 139 est aussi SMB mais 445 est plus courant pour AD moderne
-        "Kerberos (88)": ("Kerberos", 88),
-        "DNS (53)": ("DNS", 53),
-        "GlobalCatalog LDAP (3268)": ("GlobalCatalog_LDAP", 3268),
-        "GlobalCatalog LDAPS (3269)": ("GlobalCatalog_LDAPS", 3269),
-        "RPC Mapper (135)": ("RPC_Mapper", 135),
+    # Affichage des résultats
+    print("\n--- Résultats du Scan Préliminaire ---")
+    max_desc_len = 0
+    if prelim_results:
+        max_desc_len = max(len(r["description"]) for r in prelim_results)
+
+    for res in prelim_results:
+        print(f"  {res['description']:<{max_desc_len}} : {res['status']}")
+        if res.get("details"):
+            print(f"    {AnsiColors.WHITE}Détails: {res['details']}{AnsiColors.ENDC}")
+    print("--- Fin du Scan Préliminaire ---\n")
+
+    # Demander à l'utilisateur s'il veut mettre à jour le domaine global si trouvé
+    # Ceci est déjà fait dans la section LDAP ci-dessus.
+
+def user_discovery_mode(target_ip, session):
+    """Menu pour les techniques de découverte d'utilisateurs."""
+    user_discovery_commands_help = {
+        "help": "Afficher ce message d'aide.",
+        "kerbrute_userenum <wordlist> [domain]": "Utiliser Kerbrute pour l'énumération d'utilisateurs (nécessite un domaine).",
+        "rpc_enumdomusers [user] [pass] [domain]": "Utiliser rpcclient enumdomusers (identifiants optionnels).",
+        "rpc_enumdomusers_current_creds": "Utiliser rpcclient enumdomusers avec les identifiants actuels.",
+        "rid_brute_anon": "Effectuer un RID brute-force SMB en anonyme.",
+        "rid_brute_creds <user> <pass> [domain]": "Effectuer un RID brute-force SMB avec les identifiants fournis.",
+        "rid_brute_current_creds": "Effectuer un RID brute-force SMB avec les identifiants actuels.",
+        "run_all_discovery": "Exécuter toutes les techniques de découverte d'utilisateurs non authentifiées ou avec les identifiants actuels.",
+        "back": "Retourner au menu principal de la cible."
     }
+    user_discovery_completer = WordCompleter(list(user_discovery_commands_help.keys()), ignore_case=True)
 
-    for display_name, (service_key, port_num) in ad_ports_to_check.items():
-        is_open = port_num in scanned_ports_info.get(service_key, []) # Accès corrigé
-        results.append((display_name, is_open, "Ouvert" if is_open else "Fermé/Non détecté"))
+    while True:
+        try:
+            full_command = session.prompt(
+                f"ADExplorer ({AnsiColors.YELLOW}{target_ip}{AnsiColors.ENDC}) ({AnsiColors.CYAN}UserDiscovery{AnsiColors.ENDC})> ",
+                completer=user_discovery_completer,
+                auto_suggest=AutoSuggestFromHistory(),
+                style=cli_style
+            ).strip()
+            if not full_command:
+                continue
+            
+            parts = full_command.split()
+            command = parts[0].lower()
+            interactive_cmd_args = parts[1:]
 
-    # Affichage du tableau
-    print("\n--- Tableau de Statut Préliminaire ---")
-    max_test_len = max(len(r[0]) for r in results) if results else 20
-    print(f"{'Test':<{max_test_len}} | {'Statut':<8} | {'Détails'}")
-    print(f"{'-'*(max_test_len)} | {'-'*8} | {'-'*20}")
-    for test_name, status, detail in results:
-        status_str = format_status(status, "OK", "FAIL")
-        print(f"{test_name:<{max_test_len}} | {status_str:<18} | {detail}") # Ajuster la largeur de status_str si besoin
-    print("--- Fin du Tableau ---")
+            logging.info(f"Commande UserDiscovery reçue pour {target_ip}: {full_command}")
 
-# --- Fonctions de Scan ---
+            if command == "help":
+                print_target_menu({"Commandes de Découverte d'Utilisateurs": user_discovery_commands_help})
+            elif command == "back":
+                break
+            elif command == "exit":
+                logging.info("Demande de sortie de l'application.")
+                print("Au revoir !")
+                sys.exit(0)
+            elif command == "kerbrute_userenum":
+                if not KERBRUTE_AVAILABLE:
+                    print(f"{AnsiColors.RED}[-] Kerbrute n'est pas disponible.{AnsiColors.ENDC}")
+                    continue
+                if not interactive_cmd_args:
+                    print("Usage: kerbrute_userenum <wordlist> [domain]")
+                    continue
+                wordlist_path = interactive_cmd_args[0]
+                domain_to_use = interactive_cmd_args[1] if len(interactive_cmd_args) > 1 else credentials.get("domain") or multi_credentials.get("domain")
+                if not domain_to_use:
+                    print(f"{AnsiColors.RED}[-] Domaine non spécifié et non configuré globalement.{AnsiColors.ENDC}")
+                    continue
+                if not os.path.exists(wordlist_path):
+                    print(f"{AnsiColors.RED}[-] Fichier wordlist introuvable: {wordlist_path}{AnsiColors.ENDC}")
+                    continue
+                
+                cmd_kerbrute = ["kerbrute", "userenum", "--dc", target_ip, "-d", domain_to_use, wordlist_path]
+                run_command(cmd_kerbrute) # Affichage en temps réel
+
+            elif command == "rpc_enumdomusers" or command == "rpc_enumdomusers_current_creds":
+                if not RPCCLIENT_AVAILABLE:
+                    print(f"{AnsiColors.RED}[-] rpcclient n'est pas disponible.{AnsiColors.ENDC}")
+                    continue
+                
+                user, password, domain = "", "", credentials.get("domain") or multi_credentials.get("domain")
+
+                if command == "rpc_enumdomusers_current_creds":
+                    user = credentials.get("username") or ""
+                    password = credentials.get("password") or ""
+                    if not user and not password: # Si les identifiants actuels sont vides, on tente en anonyme
+                        print("[*] Identifiants actuels non définis, tentative en anonyme pour rpc_enumdomusers.")
+                        user, password = "", "" 
+                elif interactive_cmd_args: # Pour rpc_enumdomusers avec args
+                    user = interactive_cmd_args[0]
+                    password = interactive_cmd_args[1] if len(interactive_cmd_args) > 1 else ""
+                    if len(interactive_cmd_args) > 2:
+                        domain = interactive_cmd_args[2]
+                
+                # Construire la commande rpcclient
+                # rpcclient -U "DOMAIN\user%password" -c "enumdomusers" <target_ip>
+                # Si user est vide, on tente une session nulle : -U "" ou -U "%"
+                auth_str = ""
+                if user: # Si un utilisateur est fourni (même vide pour session nulle explicite)
+                    if domain:
+                        auth_str = f"{domain}\\{user}%{password}"
+                    else: # Si pas de domaine, on suppose que l'utilisateur est local ou que le DC le gère
+                        auth_str = f"{user}%{password}"
+                else: # Anonyme
+                    auth_str = "%" # Pour rpcclient, juste % pour anonyme ou user vide
+
+                cmd_rpc = ["rpcclient", "-U", auth_str, "-c", "enumdomusers", target_ip]
+                run_command(cmd_rpc)
+            
+            elif command.startswith("rid_brute"):
+                if not NXC_AVAILABLE:
+                    print(f"{AnsiColors.RED}[-] NetExec (nxc) n'est pas disponible.{AnsiColors.ENDC}")
+                    continue
+
+                user_param, pass_param, domain_param = "", "", credentials.get("domain") or multi_credentials.get("domain")
+
+                if command == "rid_brute_anon":
+                    print("[*] Tentative de RID brute-force SMB en anonyme...")
+                elif command == "rid_brute_current_creds":
+                    user_param = credentials.get("username") or ""
+                    pass_param = credentials.get("password") or ""
+                    if not user_param and not pass_param:
+                        print("[*] Identifiants actuels non définis, tentative de RID brute-force en anonyme.")
+                    else:
+                        print(f"[*] Tentative de RID brute-force SMB avec les identifiants actuels ({domain_param}\\{user_param})...")
+                elif command == "rid_brute_creds":
+                    if len(interactive_cmd_args) < 2:
+                        print("Usage: rid_brute_creds <user> <password> [domain]")
+                        continue
+                    user_param = interactive_cmd_args[0]
+                    pass_param = interactive_cmd_args[1]
+                    if len(interactive_cmd_args) > 2:
+                        domain_param = interactive_cmd_args[2]
+                    print(f"[*] Tentative de RID brute-force SMB avec {domain_param}\\{user_param}...")
+
+                cmd_rid = [NXC_CMD, "smb", target_ip, "-u", user_param, "-p", pass_param, "--rid-brute"]
+                if domain_param and user_param : # Le domaine n'est pertinent que si un utilisateur est spécifié
+                    cmd_rid.extend(["-d", domain_param])
+                
+                # Spécifier une plage de RID si nécessaire, sinon nxc utilise des valeurs par défaut
+                # cmd_rid.extend(["--rid-brute", "500-1500"]) # Exemple de plage
+                run_command(cmd_rid)
+
+            elif command == "run_all_discovery":
+                print("[*] Exécution de toutes les techniques de découverte d'utilisateurs (non-auth et avec identifiants actuels)...")
+                # Simuler l'appel des commandes appropriées
+                # Kerbrute (si domaine connu)
+                domain_to_use_kerbrute = credentials.get("domain") or multi_credentials.get("domain")
+                if KERBRUTE_AVAILABLE and domain_to_use_kerbrute:
+                    print("\n--- Tentative Kerbrute (nécessite une wordlist par défaut ou une configuration)... ---")
+                    print("INFO: Kerbrute nécessite une wordlist. Cette exécution 'run_all' ne spécifie pas de wordlist.")
+                    print("      Exécutez 'kerbrute_userenum <wordlist>' manuellement pour un scan complet.")
+                    # On pourrait avoir une petite wordlist par défaut ici, ou skipper.
+                else:
+                    print("\n--- Kerbrute non disponible ou domaine non configuré. ---")
+
+                # RPC EnumDomUsers (anonyme et avec identifiants actuels)
+                if RPCCLIENT_AVAILABLE:
+                    print("\n--- Tentative RPC EnumDomUsers (Anonyme)... ---")
+                    run_command(["rpcclient", "-U", "%", "-c", "enumdomusers", target_ip])
+                    
+                    current_user = credentials.get("username")
+                    current_pass = credentials.get("password")
+                    current_domain = credentials.get("domain") or multi_credentials.get("domain")
+                    if current_user:
+                        print("\n--- Tentative RPC EnumDomUsers (Identifiants Actuels)... ---")
+                        auth_str_current = f"{current_domain}\\{current_user}%{current_pass}" if current_domain else f"{current_user}%{current_pass}"
+                        run_command(["rpcclient", "-U", auth_str_current, "-c", "enumdomusers", target_ip])
+                else:
+                    print("\n--- rpcclient non disponible. ---")
+
+                # RID Brute (anonyme et avec identifiants actuels)
+                if NXC_AVAILABLE:
+                    print("\n--- Tentative RID Brute SMB (Anonyme)... ---")
+                    run_command([NXC_CMD, "smb", target_ip, "-u", "", "-p", "", "--rid-brute"])
+
+                    current_user_nxc = credentials.get("username") or ""
+                    current_pass_nxc = credentials.get("password") or ""
+                    current_domain_nxc = credentials.get("domain") or multi_credentials.get("domain")
+                    if credentials.get("username"): # Seulement si un utilisateur est défini
+                        print("\n--- Tentative RID Brute SMB (Identifiants Actuels)... ---")
+                        cmd_rid_current = [NXC_CMD, "smb", target_ip, "-u", current_user_nxc, "-p", current_pass_nxc, "--rid-brute"]
+                        if current_domain_nxc:
+                            cmd_rid_current.extend(["-d", current_domain_nxc])
+                        run_command(cmd_rid_current)
+                else:
+                    print("\n--- NetExec (nxc) non disponible pour RID Brute. ---")
+                print("\n[*] Fin de toutes les découvertes d'utilisateurs.")
+
+            else:
+                print(f"Commande inconnue dans le Mode Découverte d'Utilisateurs: {command}. Tapez 'help'.")
+
+        except KeyboardInterrupt:
+            print("\n[!] Action annulée dans le Mode Découverte d'Utilisateurs.")
+            continue
+        except EOFError:
+            print("\n[!] Action annulée dans le Mode Découverte d'Utilisateurs.")
+            continue
+        except Exception as e:
+            logging.error(f"Erreur inattendue dans le Mode Découverte d'Utilisateurs: {e}")
+            print(f"{AnsiColors.RED}Erreur: {e}{AnsiColors.ENDC}")
+            continue
+
 def check_port(ip, port, open_ports_list, service_name):
     """Vérifie si un port TCP est ouvert."""
     try:
