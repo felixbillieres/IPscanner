@@ -464,18 +464,21 @@ def main():
     # Charger les user agents une fois globalement
     load_user_agents(args.user_agents)
 
-    print("--- Configuration Globale du Scan ---")
-    print(f"[*] Hôte Cible: {Colors.CYAN if not args.no_color else ''}{args.target_host}{Colors.ENDC if not args.no_color else ''}")
-    print(f"[*] Mode: {Colors.YELLOW}{'Furtif' if args.stealth else 'Agressif'}{Colors.ENDC}")
-    print(f"[*] Threads: {Colors.YELLOW}{args.threads}{Colors.ENDC}")
-    print(f"[*] Wordlist: {Colors.YELLOW}{args.wordlist}{Colors.ENDC}")
-    print(f"[*] Fichier d'extensions: {Colors.YELLOW}{args.extensions}{Colors.ENDC}")
+    print(f"{Colors.BOLD}--- Initialisation du Scan DIRScanner ---{Colors.ENDC}")
+    print(f"[*] Hôte Cible Principal: {Colors.CYAN if not args.no_color else ''}{args.target_host}{Colors.ENDC if not args.no_color else ''}")
+    print(f"[*] Ports Web à sonder: {Colors.YELLOW if not args.no_color else ''}{args.ports}{Colors.ENDC if not args.no_color else ''}")
+    print(f"[*] Mode de scan par service: {Colors.YELLOW if not args.no_color else ''}{'Furtif' if args.stealth else 'Agressif'}{Colors.ENDC if not args.no_color else ''}")
+    if not args.stealth:
+        print(f"[*] Threads par service (pour scan wordlist): {Colors.YELLOW if not args.no_color else ''}{args.threads}{Colors.ENDC if not args.no_color else ''}")
+    print(f"[*] Wordlist par service: {Colors.YELLOW if not args.no_color else ''}{args.wordlist}{Colors.ENDC if not args.no_color else ''}")
+    print(f"[*] Fichier d'extensions par service: {Colors.YELLOW if not args.no_color else ''}{args.extensions}{Colors.ENDC if not args.no_color else ''}")
     if args.stealth:
-        print(f"[*] Délai furtif moyen: {Colors.YELLOW}{args.stealth_delay}s{Colors.ENDC}")
-        print(f"[*] Fichier User-Agents: {Colors.YELLOW}{args.user_agents}{Colors.ENDC}")
+        print(f"[*] Délai furtif moyen par service: {Colors.YELLOW if not args.no_color else ''}{args.stealth_delay}s{Colors.ENDC if not args.no_color else ''}")
+    print(f"[*] Fichier User-Agents global: {Colors.YELLOW if not args.no_color else ''}{args.user_agents}{Colors.ENDC if not args.no_color else ''}")
     print("-----------------------------------\n")
 
-    # 1. Découverte des services web sur l'hôte cible
+    # Étape 1: Découverte des services web sur l'hôte cible via scan de ports
+    print(f"{Colors.BOLD}--- Étape 1: Découverte des Services Web ---{Colors.ENDC}")
     try:
         ports_to_scan_list = [int(p.strip()) for p in args.ports.split(',')]
     except ValueError:
@@ -491,6 +494,9 @@ def main():
     start_time_global = time.time()
     total_requests_made = 0 # Réinitialiser le compteur global
     found_results = [] # Réinitialiser les résultats globaux
+
+    if web_service_urls:
+        print(f"\n{Colors.BOLD}--- Étape 2: Scan Détaillé par Service Web Découvert ---{Colors.ENDC}")
 
     for service_url in web_service_urls:
         print(f"\n--- Scan du Service Web: {Colors.MAGENTA if not args.no_color else ''}{service_url}{Colors.ENDC if not args.no_color else ''} ---")
