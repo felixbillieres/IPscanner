@@ -1131,10 +1131,10 @@ def main_loop(target_ip, scanned_ports, session):
             elif command == "testcreds":
                 run_credential_tests(target_ip, scanned_ports, multi_credentials, session)
             elif command == "generatehosts":
-                if not args:
+                if not command_parts[1:]:
                     print("Usage: generatehosts <subnet_cidr> (ex: 10.10.10.0/24)")
                     continue
-                subnet_to_scan = args[0]
+                subnet_to_scan = command_parts[1]
                 # Valider le format du subnet CIDR (simpliste)
                 if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$", subnet_to_scan):
                     print(f"[-] Format de sous-réseau CIDR invalide: {subnet_to_scan}")
