@@ -54,6 +54,7 @@ found_results = []
 total_requests_made = 0
 lock = threading.Lock()
 print_lock = threading.Lock()
+scan_results_lock = threading.Lock() # Verrou pour ajouter aux listes de résultats partagées
 
 # --- Agents Utilisateurs ---
 USER_AGENTS = []
@@ -195,62 +196,109 @@ def run_command(command_list, capture_output=True, text=True, shell=False):
         print(f"{Colors.RED}[-] Erreur lors de l'exécution de '{command_str}': {e}{Colors.ENDC}")
         return None, str(e), -1
 
-# --- Découverte des Services Web ---
-DEFAULT_WEB_PORTS = [80, 443, 8000, 8080, 8081, 8443, 8888]
+# --- Découverte des Services Web (Scan Complet de Ports) ---
+# Liste globale pour stocker les URLs découvertes par les workers du scan de ports
+discovered_urls_from_full_scan_list = []
 
-def discover_web_services(target_host, ports_to_scan=None, no_color_mode=False):
-    """Scanne les ports spécifiés pour des services web HTTP/HTTPS."""
-    if ports_to_scan is None:
-        ports_to_scan = DEFAULT_WEB_PORTS
-    
-    active_services = []
-    print(f"[*] Scan des ports web sur {target_host}...")
+def check_port_for_web_service(target_host, port, no_color_mode):
+    """
+    Vérifie si un service HTTP ou HTTPS écoute sur le port spécifié.
+    Ajoute les URLs trouvées à discovered_urls_from_full_scan_list.
+    """
+    global discovered_urls_from_full_scan_list
+    # Essayer HTTP
+    url_http = f"http://{target_host}:{port}"
+    try:
+        # Timeout court pour une vérification rapide
+        response = requests.head(url_http, timeout=2, allow_redirects=False, headers={'User-Agent': get_random_user_agent()})
+        # Considérer tout 2xx, 3xx, 401, 403 comme un service web
+        # Exclure 404, 400 pour la vérification de base car cela pourrait être un chemin non trouvé plutôt qu'un service absent
+        if 200 <= response.status_code < 500 and response.status_code not in [400, 404]:
+            with print_lock:
+                print(f"{Colors.GREEN if not no_color_mode else ''}[+] Service HTTP potentiel trouvé sur {url_http} (Status: {response.status_code}){Colors.ENDC if not no_color_mode else ''}")
+            with scan_results_lock:
+                if url_http not in discovered_urls_from_full_scan_list:
+                    discovered_urls_from_full_scan_list.append(url_http)
+            return # Service HTTP trouvé, pas besoin de vérifier HTTPS sur le même port pour cette découverte
+    except requests.exceptions.SSLError:
+        # Si HTTP échoue avec SSLError, c'est probablement HTTPS
+        pass # Continuer pour vérifier HTTPS
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.RequestException):
+        # Le port ne répond pas en HTTP ou autre problème
+        pass
 
-    for port in ports_to_scan:
+    # Essayer HTTPS (surtout si HTTP a échoué avec SSLError ou pour d'autres raisons)
+    url_https = f"https://{target_host}:{port}"
+    try:
+        response = requests.head(url_https, timeout=2, verify=False, allow_redirects=False, headers={'User-Agent': get_random_user_agent()})
+        if 200 <= response.status_code < 500 and response.status_code not in [400, 404]:
+            with print_lock:
+                print(f"{Colors.GREEN if not no_color_mode else ''}[+] Service HTTPS potentiel trouvé sur {url_https} (Status: {response.status_code}){Colors.ENDC if not no_color_mode else ''}")
+            with scan_results_lock:
+                if url_https not in discovered_urls_from_full_scan_list:
+                    discovered_urls_from_full_scan_list.append(url_https)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.RequestException):
+        # Le port ne répond pas en HTTPS
+        pass
+
+def port_scan_worker(target_host, port_queue, no_color_mode):
+    """Worker pour le scan de ports."""
+    while not port_queue.empty():
         try:
-            with socket.create_connection((target_host, port), timeout=1):
-                # Port ouvert, essayons de déterminer HTTP/HTTPS
-                # Simplification: 443 est HTTPS, 80 est HTTP. Pour les autres, on essaie HTTP d'abord.
-                # Une détection robuste nécessiterait d'envoyer une requête ou de tenter une connexion SSL.
-                if port == 443 or port == 8443 or port == 3001: # Ports typiquement HTTPS
-                    protocol = "https"
-                else:
-                    protocol = "http" # Par défaut HTTP pour les autres
+            port = port_queue.get_nowait()
+        except Exception: # queue.Empty n'est pas importé directement, utilisons Exception plus large
+            break
+        
+        # Une vérification TCP de base pourrait être ajoutée ici pour plus de rapidité sur les ports fermés
+        # avant d'appeler check_port_for_web_service, mais pour garder simple, on laisse requests gérer.
+        # Exemple:
+        # try:
+        #     sock = socket.create_connection((target_host, port), timeout=0.5)
+        #     sock.close()
+        #     # Si la connexion réussit, alors vérifier le service web
+        #     check_port_for_web_service(target_host, port, no_color_mode)
+        # except (socket.error, socket.timeout):
+        #     pass # Port fermé ou non accessible rapidement
 
-                # Tentative de confirmation HTTPS pour les ports non standards
-                if protocol == "http" and port not in [80, 8000, 8080]: # Éviter de tester SSL sur des ports HTTP connus
-                    try:
-                        context = ssl.create_default_context()
-                        with socket.create_connection((target_host, port), timeout=1) as sock:
-                            with context.wrap_socket(sock, server_hostname=target_host) as ssock:
-                                protocol = "https" # Connexion SSL réussie
-                                print(f"  {Colors.GREEN if not no_color_mode else ''}[+] Port {port} ({protocol.upper()}) semble être HTTPS.{Colors.ENDC if not no_color_mode else ''}")
-                    except (ssl.SSLError, socket.timeout, ConnectionRefusedError, OSError):
-                        print(f"  {Colors.YELLOW if not no_color_mode else ''}[*] Port {port} ({protocol.upper()}) semble être HTTP (SSL a échoué ou timeout).{Colors.ENDC if not no_color_mode else ''}")
-                        pass # Reste HTTP
+        check_port_for_web_service(target_host, port, no_color_mode)
+        port_queue.task_done()
 
-                base_url = f"{protocol}://{target_host}:{port}"
-                # Éviter les ports standards dans l'URL si possible
-                if (protocol == "http" and port == 80) or (protocol == "https" and port == 443):
-                    base_url = f"{protocol}://{target_host}"
-                
-                active_services.append(base_url)
-                if not no_color_mode:
-                    print(f"  {Colors.GREEN}[+] Service web détecté sur: {base_url}{Colors.ENDC}")
-                else:
-                    print(f"  [+] Service web détecté sur: {base_url}")
+DEFAULT_PORT_SCAN_THREADS = 100 # Nombre de threads pour le scan de ports
 
-        except (socket.timeout, ConnectionRefusedError, OSError):
-            pass # Port non ouvert ou non joignable
+def discover_web_services_full_scan(target_host, num_threads_port_scan=DEFAULT_PORT_SCAN_THREADS, no_color_mode=False):
+    """
+    Scanne tous les ports TCP (1-65535) sur l'hôte cible pour trouver des services HTTP/HTTPS.
+    Utilise des threads pour accélérer le scan.
+    """
+    global discovered_urls_from_full_scan_list
+    discovered_urls_from_full_scan_list = [] # Réinitialiser pour chaque appel
+
+    print(f"[*] Lancement du scan de tous les ports TCP (1-65535) sur {Colors.CYAN if not no_color_mode else ''}{target_host}{Colors.ENDC if not no_color_mode else ''} pour services web...")
+    print(f"[*] Utilisation de {num_threads_port_scan} threads pour le scan de ports.")
+    print(f"{Colors.YELLOW if not no_color_mode else ''}[!] Note: Ce scan peut prendre du temps. Pour des scans plus rapides, envisagez d'utiliser Nmap.{Colors.ENDC if not no_color_mode else ''}")
     
-    if not active_services and not no_color_mode:
-        print(f"{Colors.YELLOW}[-] Aucun service web actif trouvé sur les ports scannés de {target_host}.{Colors.ENDC}")
-    elif not active_services and no_color_mode:
-        print(f"[-] Aucun service web actif trouvé sur les ports scannés de {target_host}.")
+    port_q = Queue()
+    for p in range(1, 65536): # Ports 1 à 65535
+        port_q.put(p)
 
-    return active_services
+    threads = []
+    for _ in range(num_threads_port_scan):
+        thread = threading.Thread(target=port_scan_worker, args=(target_host, port_q, no_color_mode))
+        thread.daemon = True # Permet au programme principal de se terminer même si les threads sont actifs
+        thread.start()
+        threads.append(thread)
 
-# --- Exécution de Feroxbuster ---
+    port_q.join() # Attendre que tous les éléments de la file soient traités
+
+    # Assurer que tous les threads ont eu une chance de terminer (bien que join sur la queue soit généralement suffisant)
+    # for t in threads:
+    # t.join(timeout=1.0) # Donner un petit timeout pour la terminaison
+
+    unique_urls = sorted(list(set(discovered_urls_from_full_scan_list))) # Assurer l'unicité et trier
+    print(f"[*] Scan de ports terminé. {Colors.GREEN if not no_color_mode else ''}{len(unique_urls)}{Colors.ENDC if not no_color_mode else ''} services web potentiels trouvés.")
+    return unique_urls
+
+# --- Fonctions de Scan de Contenu (Feroxbuster, Wordlist) ---
 def run_feroxbuster(target_url, no_color_mode=False):
     """Exécute Feroxbuster sur l'URL cible et retourne les URLs 200 OK."""
     global found_results
@@ -349,7 +397,6 @@ def run_feroxbuster(target_url, no_color_mode=False):
              except Exception:
                  pass # Ne pas crasher si la suppression échoue
 
-# --- Scan par Wordlist pour un Service Spécifique ---
 def perform_wordlist_scan_for_service(service_url, wordlist_file, extensions_file, num_threads, 
                                       stealth_mode, stealth_delay_val, user_agents_file_path, no_color_mode):
     """
@@ -503,11 +550,11 @@ def main():
     parser = argparse.ArgumentParser(description="Outil de découverte de contenu web automatisé et intelligent.")
     # L'argument principal est maintenant l'hôte/IP, pas une URL complète.
     parser.add_argument("target_host", help="Hôte cible (ex: example.com ou 192.168.1.10)")
-    parser.add_argument("-p", "--ports", default=",".join(map(str, DEFAULT_WEB_PORTS)),
-                        help=f"Liste de ports web à scanner, séparés par des virgules (défaut: {','.join(map(str, DEFAULT_WEB_PORTS))})")
+    # L'argument -p/--ports est supprimé car nous faisons un scan complet
     parser.add_argument("-w", "--wordlist", default=DEFAULT_WORDLIST, help=f"Chemin vers la wordlist (défaut: {DEFAULT_WORDLIST})")
     parser.add_argument("-x", "--extensions", default=DEFAULT_EXTENSIONS_FILE, help=f"Chemin vers le fichier d'extensions (défaut: {DEFAULT_EXTENSIONS_FILE})")
-    parser.add_argument("-t", "--threads", type=int, default=DEFAULT_THREADS, help=f"Nombre de threads (défaut: {DEFAULT_THREADS})")
+    parser.add_argument("-t", "--threads", type=int, default=DEFAULT_THREADS, help=f"Nombre de threads pour le scan par wordlist (défaut: {DEFAULT_THREADS})")
+    parser.add_argument("--threads-portscan", type=int, default=DEFAULT_PORT_SCAN_THREADS, help=f"Nombre de threads pour le scan de ports initial (défaut: {DEFAULT_PORT_SCAN_THREADS})")
     parser.add_argument("-s", "--stealth", action="store_true", help="Activer le mode furtif (délais, user-agents aléatoires, respect de robots.txt)")
     parser.add_argument("--stealth-delay", type=float, default=1.0, help="Délai moyen en secondes entre les requêtes en mode furtif (défaut: 1.0s)")
     parser.add_argument("--user-agents", default=DEFAULT_USER_AGENTS_FILE, help=f"Fichier des agents utilisateurs (défaut: {DEFAULT_USER_AGENTS_FILE})")
@@ -525,10 +572,11 @@ def main():
 
     print(f"{Colors.BOLD}--- Initialisation du Scan DIRScanner ---{Colors.ENDC}")
     print(f"[*] Hôte Cible Principal: {Colors.CYAN if not args.no_color else ''}{args.target_host}{Colors.ENDC if not args.no_color else ''}")
-    print(f"[*] Ports Web à sonder: {Colors.YELLOW if not args.no_color else ''}{args.ports}{Colors.ENDC if not args.no_color else ''}")
+    # Affichage des ports supprimé, car scan complet
     print(f"[*] Mode de scan par service: {Colors.YELLOW if not args.no_color else ''}{'Furtif' if args.stealth else 'Agressif'}{Colors.ENDC if not args.no_color else ''}")
     if not args.stealth:
         print(f"[*] Threads par service (pour scan wordlist): {Colors.YELLOW if not args.no_color else ''}{args.threads}{Colors.ENDC if not args.no_color else ''}")
+    print(f"[*] Threads pour scan de ports initial: {Colors.YELLOW if not args.no_color else ''}{args.threads_portscan}{Colors.ENDC if not args.no_color else ''}")
     print(f"[*] Wordlist par service: {Colors.YELLOW if not args.no_color else ''}{args.wordlist}{Colors.ENDC if not args.no_color else ''}")
     print(f"[*] Fichier d'extensions par service: {Colors.YELLOW if not args.no_color else ''}{args.extensions}{Colors.ENDC if not args.no_color else ''}")
     if args.stealth:
@@ -536,18 +584,13 @@ def main():
     print(f"[*] Fichier User-Agents global: {Colors.YELLOW if not args.no_color else ''}{args.user_agents}{Colors.ENDC if not args.no_color else ''}")
     print("-----------------------------------\n")
 
-    # Étape 1: Découverte des services web sur l'hôte cible via scan de ports
-    print(f"{Colors.BOLD}--- Étape 1: Découverte des Services Web ---{Colors.ENDC}")
-    try:
-        ports_to_scan_list = [int(p.strip()) for p in args.ports.split(',')]
-    except ValueError:
-        print(f"{Colors.RED if not args.no_color else ''}[!] Format de liste de ports invalide. Utilisez des nombres séparés par des virgules.{Colors.ENDC if not args.no_color else ''}")
-        sys.exit(1)
-        
-    web_service_urls = discover_web_services(args.target_host, ports_to_scan_list, args.no_color)
+    # Étape 1: Découverte des services web sur l'hôte cible via scan de ports complet
+    print(f"{Colors.BOLD}--- Étape 1: Découverte des Services Web (Scan Complet des Ports) ---{Colors.ENDC}")
+    
+    web_service_urls = discover_web_services_full_scan(args.target_host, args.threads_portscan, args.no_color)
 
     if not web_service_urls:
-        print(f"[-] Aucun service web trouvé sur {args.target_host} avec les ports spécifiés. Arrêt.")
+        print(f"[-] Aucun service web trouvé sur {args.target_host} après un scan complet des ports. Arrêt.")
         return
 
     start_time_global = time.time()

